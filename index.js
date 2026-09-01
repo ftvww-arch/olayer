@@ -2,11 +2,8 @@ const express = require('express');
 const axios = require('axios');
 const app = express();
 
-const STREAM_URL = 'https://afast-cdn1-liu.cdnz.quest/hls2/01/00070/k7i1jzwik4i0_n/index-v1-a1.m3u8?t=4mGjShrsHVnrOWp-h6aNIcKwFTHvV1V3IA_sevyC4Ak&s=1788239623&e=18000&v=169417097&i=0.3&sp=0';
-
-// الترويسات المطلوبة لتجاوز حظر الـ CDN
 const CUSTOM_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Referer': 'https://cdnz.quest/',
     'Origin': 'https://cdnz.quest'
 };
@@ -17,33 +14,54 @@ app.use((req, res, next) => {
     next();
 });
 
-// 1. جلب وتعديل قائمة M3U8
-app.get('/manifest.m3u8', async (req, res) => {
-    try {
-        const response = await axios.get(STREAM_URL, { headers: CUSTOM_HEADERS });
-        let data = response.data;
+// استقبال رابط m3u8 ديناميكياً مباشرة من المسار
+app.get('/url/*', async (req, res) => {
+    // استخراج الرابط الكامل مع كافة المعلمات التابعة له (Query parameters)
+    const targetUrl = req.originalUrl.replace(/^\/url\//, '');
 
-        // إعادة توجيه كافة روابط الشرائح والقوائم الفرعية عبر البروكسي
-        data = data.replace(/(https?:\/\/[^\s]+)/g, (url) => {
-            return `http://localhost:3000/segment?url=${encodeURIComponent(url)}`;
+    if (!targetUrl || !targetUrl.startsWith('http')) {
+        return res.status(400).send('رابط غير صالح');
+    }
+
+    try {
+        const response = await axios.get(targetUrl, {
+            headers: CUSTOM_HEADERS,
+            timeout: 10000
+        });
+
+        const lines = response.data.split('\n');
+        const updatedLines = lines.map(line => {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) return line;
+
+            // تحويل الروابط النسبية إلى روابط كاملة بناءً على رابط المصدر
+            const absoluteUrl = new URL(trimmed, targetUrl).href;
+
+            // إذا كانت القائمة تحتوي على ملف m3u8 فرعي أو شرائح ts
+            if (absoluteUrl.includes('.m3u8')) {
+                return `http://localhost:3000/url/${absoluteUrl}`;
+            } else {
+                return `http://localhost:3000/segment?url=${encodeURIComponent(absoluteUrl)}`;
+            }
         });
 
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-        res.send(data);
+        res.send(updatedLines.join('\n'));
     } catch (error) {
-        res.status(500).send('Error fetching playlist: ' + error.message);
+        console.error('خطأ أثناء جلب الملف:', error.message);
+        res.status(error.response?.status || 500).send('فشل جلب ملف m3u8');
     }
 });
 
-// 2. تمرير شرائح الفيديو (.ts) مع الترويسات
+// تمرير شرائح البث (.ts)
 app.get('/segment', async (req, res) => {
-    const targetUrl = req.query.url;
-    if (!targetUrl) return res.status(400).send('Missing URL');
+    const segmentUrl = req.query.url;
+    if (!segmentUrl) return res.status(400).send('رابط الشريحة مفقود');
 
     try {
         const response = await axios({
             method: 'get',
-            url: targetUrl,
+            url: segmentUrl,
             headers: CUSTOM_HEADERS,
             responseType: 'stream'
         });
@@ -51,10 +69,10 @@ app.get('/segment', async (req, res) => {
         res.setHeader('Content-Type', 'video/mp2t');
         response.data.pipe(res);
     } catch (error) {
-        res.status(500).send('Segment fetch failed');
+        res.status(500).send('فشل جلب شريحة الفيديو');
     }
 });
 
 app.listen(3000, () => {
-    console.log('Proxy running on http://localhost:3000/manifest.m3u8');
+    console.log('Dynamic Proxy Server running on port 3000');
 });

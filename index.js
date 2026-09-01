@@ -177,6 +177,7 @@ app.get('/play/:token/manifest.m3u8', async (req, res) => {
 });
 
 // مسار مباشر ودائم بدون توكن
+// مسار مباشر ودائم يدعم الروابط المحولة (Redirects)
 app.get('/direct/manifest.m3u8', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Please provide a ?url=...');
@@ -185,14 +186,25 @@ app.get('/direct/manifest.m3u8', async (req, res) => {
         const config = {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+                'Accept': '*/*',
+                'Connection': 'keep-alive',
                 'Range': 'bytes=0-'
             },
+            maxRedirects: 10, // السماح باتباع حتى 10 عمليات تحويل تلقائياً
             validateStatus: status => status >= 200 && status < 500
         };
 
+        // استخدام axios لجلب الرابط مع تتبع التحويلات
         const response = await axios.get(targetUrl, config);
+        
+        // استخراج الرابط النهائي الفعلي بعد كل عمليات التحويل
         const finalUrl = response.request.res.responseUrl || targetUrl;
         const baseUrl = new URL(finalUrl).origin;
+
+        // التأكد من أن الاستجابة هي نص وليست بيانات ثنائية
+        if (typeof response.data !== 'string') {
+            return res.status(500).send('Invalid manifest response format after redirect.');
+        }
 
         let lines = response.data.split('\n');
         let rewrittenLines = lines.map(line => {
@@ -216,7 +228,8 @@ app.get('/direct/manifest.m3u8', async (req, res) => {
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(rewrittenLines.join('\n'));
     } catch (error) {
-        res.status(500).send('Error fetching manifest');
+        console.error('Redirect Manifest Error:', error.message);
+        res.status(500).send('Error fetching and following redirect for manifest');
     }
 });
 

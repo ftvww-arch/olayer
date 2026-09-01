@@ -15,34 +15,75 @@ app.use((req, res, next) => {
     next();
 });
 
-// مسار توليد وتعديل ملف الـ M3u8 ليكون رابط مانفيست متوافق بالكامل
+// دالة مساعدة لتتبع روابط إعادة التوجيه وجلب الـ Manifest الحقيقي مع الـ Token تلقائياً
+async function fetchStreamManifest(targetUrl) {
+    let currentUrl = targetUrl;
+    let sessionCookies = '';
+    
+    // محاولة تتبع الـ Redirects يدوياً لضمان التقاط الـ Token والكوكيز
+    for (let i = 0; i < 5; i++) {
+        const config = {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+                'Accept': '*/*',
+                'Referer': 'http://orien.live/',
+                'Origin': 'http://orien.live',
+                'Range': 'bytes=0-'
+            },
+            maxRedirects: 0, // منع أكسيوس من التعامل التلقائي لكي نلتقط الكوكيز والـ Headers
+            validateStatus: status => status >= 200 && status < 400
+        };
+
+        if (sessionCookies) config.headers['Cookie'] = sessionCookies;
+
+        const response = await axios.get(currentUrl, config);
+
+        if (response.headers['set-cookie']) {
+            sessionCookies = response.headers['set-cookie'].join('; ');
+        }
+
+        // إذا حدث إعادة توجيه (Redirect)
+        if ([301, 302, 303, 307, 308].includes(response.status)) {
+            const redirectLocation = response.headers['location'];
+            if (!redirectLocation) break;
+            
+            // التعامل مع الروابط النسبية أو المطلقة
+            currentUrl = new URL(redirectLocation, currentUrl).href;
+        } else {
+            // وصلنا للرابط النهائي المستهدف
+            return {
+                data: response.data,
+                finalUrl: currentUrl,
+                cookies: sessionCookies
+            };
+        }
+    }
+    
+    // Fallback في حال لم يحدث توجيه تقليدي
+    const finalRes = await axios.get(currentUrl, {
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'http://orien.live/'
+        }
+    });
+    return { data: finalRes.data, finalUrl: currentUrl, cookies: sessionCookies };
+}
+
+// مسار توليد وتعديل المانفيست تلقائياً من رابط orien.live الأساسي
 app.get('/manifest.m3u8', async (req, res) => {
-    const targetUrl = req.query.url;
+    let targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('No URL provided');
 
     try {
-        const config = {
-            headers: {
-                'Host': new URL(targetUrl).host,
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
-                'Accept': '*/*',
-                'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Range': 'bytes=0-',
-                'Referer': targetUrl
-            },
-            validateStatus: status => status >= 200 && status < 500
-        };
-
-        const response = await axios.get(targetUrl, config);
-        const finalUrl = response.request.res.responseUrl || targetUrl;
+        // جلب البيانات وتتبع الـ Token والـ IP الجديد أوتوماتيكياً
+        const { data, finalUrl } = await fetchStreamManifest(targetUrl);
         const baseUrl = new URL(finalUrl).origin;
 
-        let lines = response.data.split('\n');
+        let lines = typeof data === 'string' ? data.split('\n') : data.toString().split('\n');
+        
         let rewrittenLines = lines.map(line => {
             let trimmed = line.trim();
-            if (trimmed.startsWith('#') || !trimmed) return logClean(trimmed);
+            if (trimmed.startsWith('#') || !trimmed) return trimmed;
 
             let absoluteLink = '';
             if (trimmed.startsWith('http')) {
@@ -53,7 +94,7 @@ app.get('/manifest.m3u8', async (req, res) => {
                 absoluteLink = new URL(trimmed, finalUrl).href;
             }
 
-            // توجيه قطع الـ ts عبر مسار البروكسي الخاص بنا
+            // توجيه قطع الـ ts عبر البروكسي
             const hostProtocol = req.protocol;
             const hostName = req.get('host');
             return `${hostProtocol}://${hostName}/proxy?url=${encodeURIComponent(absoluteLink)}`;
@@ -62,12 +103,10 @@ app.get('/manifest.m3u8', async (req, res) => {
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         return res.send(rewrittenLines.join('\n'));
     } catch (error) {
-        console.error(`[Manifest Error]:`, error.message);
-        res.status(500).send('Error generating manifest');
+        console.error(`[Manifest Error] ${targetUrl}:`, error.message);
+        res.status(500).send('Error resolving and generating manifest');
     }
 });
-
-function logClean(val) { return val; }
 
 // مسار البروكسي لجلب قطع الفيديو .ts
 app.get('/proxy', async (req, res) => {
@@ -77,8 +116,8 @@ app.get('/proxy', async (req, res) => {
     try {
         const config = {
             headers: {
-                'Host': new URL(targetUrl).host,
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+                'Referer': 'http://orien.live/',
                 'Range': 'bytes=0-'
             },
             responseType: 'stream',
@@ -97,11 +136,10 @@ app.get('/proxy', async (req, res) => {
     }
 });
 
-// الصفحة الرئيسية تعرض رابط المانفيست وتشغل الفيديو
+// الصفحة الرئيسية لتجربة الرابط الأساسي
 app.get('/', (req, res) => {
-    const rawStream = 'http://89.33.13.177/live/16304575049793/43581893985883/585734.m3u8?token=aUdHbU.acXXydc.y.aUzdaby.yczHbdcU.X.y.TR.m3u8.400893ed4a1dcb1f9bc8504f26d7e5f13d29a85368613b78395517546617301c...b3JpZW4ubGl2ZQ==';
-    
-    // بناء رابط المانفيست الخاص بسيرفرك
+    // الآن يمكنك وضع رابط orien.live الأساسي مباشرة هنا
+    const rawStream = 'http://orien.live/live/16304575049793/43581893985883/585734.m3u8';
     const manifestUrl = `${req.protocol}://${req.get('host')}/manifest.m3u8?url=${encodeURIComponent(rawStream)}`;
 
     res.send(`
@@ -120,7 +158,7 @@ app.get('/', (req, res) => {
 </head>
 <body>
     <div class="box">
-        <h3>رابط المانفيست الخاص بك (مباشر ومعدل):</h3>
+        <h3>رابط المانفيست المولد تلقائياً:</h3>
         <input type="text" readonly value="${manifestUrl}" onclick="this.select();">
         <video id="videoPlayer" controls autoplay playsinline></video>
     </div>

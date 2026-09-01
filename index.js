@@ -2,7 +2,7 @@ const express = require('express');
 const app = express();
 const PORT = 3000;
 
-const STREAM_URL = 'http://orien.live/live/16304575049793/43581893985883/445377.m3u8';
+const STREAM_URL = 'http://orien.live/live/16304575049793/43581893985883/585734.m3u8';
 
 app.get('/', (req, res) => {
   res.send(`

@@ -1,13 +1,9 @@
 const express = require('express');
 const axios = require('axios');
 const compression = require('compression');
-const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-const SECRET_KEY = process.env.SECRET_KEY || 'my-super-secret-streaming-key-2026';
-const TOKEN_EXPIRY_HOURS = 2; // صلاحية الساعتين
 
 app.use(compression());
 
@@ -19,89 +15,62 @@ app.use((req, res, next) => {
     next();
 });
 
-// دالة لتوليد توكن مشفر وموقع وآمن
-function generateShortToken(targetUrl) {
-    const expiresAt = Date.now() + (TOKEN_EXPIRY_HOURS * 60 * 60 * 1000);
-    const payload = JSON.stringify({ url: targetUrl, exp: expiresAt });
-    const base64Payload = Buffer.from(payload).toString('base64url');
-    
-    const signature = crypto
-        .createHmac('sha256', SECRET_KEY)
-        .update(base64Payload)
-        .digest('hex');
-        
-    return `${base64Payload}.${signature}`;
-}
+// الرابط الثابت للقناة الذي طلبته
+const CHANNEL_ID = '445376';
+const INITIAL_STREAM_URL = `http://orien.live/live/16304575049793/43581893985883/${CHANNEL_ID}.m3u8`;
 
-// دالة فحص التوكن والتحقق من الصلاحية (الساعتين)
-function decryptShortToken(token) {
-    try {
-        const parts = token.split('.');
-        if (parts.length !== 2) return { error: 'Invalid' };
-        
-        const [base64Payload, signature] = parts;
-        
-        const expectedSignature = crypto
-            .createHmac('sha256', SECRET_KEY)
-            .update(base64Payload)
-            .digest('hex');
-            
-        if (signature !== expectedSignature) {
-            return { error: 'Invalid' };
-        }
-        
-        const payloadJson = Buffer.from(base64Payload, 'base64url').toString('utf8');
-        const { url, exp } = JSON.parse(payloadJson);
-        
-        if (Date.now() > exp) {
-            return { error: 'Expired' };
-        }
-        
-        return { targetUrl: url };
-    } catch (e) {
-        return { error: 'Invalid' };
-    }
-}
-
-let manifestCache = { data: null, timestamp: 0, token: null };
-const CACHE_TTL = 4000;
+// نظام كاش ذكي لتتبع وتحديث الـ Token والـ IP تلقائياً من السيرفر الأصلي
+let manifestCache = { data: null, timestamp: 0 };
+const CACHE_TTL = 4000; // تحديث كل 4 ثوانٍ لضمان بقاء البث متوافقاً مع التوكن المتجدد
 let pendingManifestPromise = null;
 
-// مسار توليد الرابط المختصر
-app.get('/generate', (req, res) => {
-    const targetUrl = req.query.url;
-    if (!targetUrl) return res.status(400).send('Please provide a ?url=...');
+async function fetchAndResolveManifest() {
+    let currentUrl = INITIAL_STREAM_URL;
+    let sessionCookies = '';
 
-    const token = generateShortToken(targetUrl);
-    const hostProtocol = req.protocol;
-    const hostName = req.get('host');
-    const shortLink = `${hostProtocol}://${hostName}/play/${token}/manifest.m3u8`;
+    // تتبع الـ Redirects لجلب الـ IP الحقيقي والـ Token تلقائياً
+    for (let i = 0; i < 5; i++) {
+        const config = {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+                'Referer': 'http://orien.live/',
+                'Range': 'bytes=0-'
+            },
+            maxRedirects: 0,
+            validateStatus: status => status >= 200 && status < 400
+        };
 
-    res.send(`
-        <html dir="rtl" style="background:#0f172a;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;">
-            <h3>رابط البث المشفر والمؤقت (صالح لمدة ساعتين فقط):</h3>
-            <input type="text" readonly value="${shortLink}" style="width:80%;max-width:600px;padding:10px;background:#1e293b;border:1px solid #475569;color:#38bdf8;border-radius:6px;" onclick="this.select();">
-            <p style="color:#94a3b8;margin-top:10px;">هذا الرابط سيتوقف عن العمل تلقائياً بعد مرور ساعتين.</p>
-        </html>
-    `);
-});
+        if (sessionCookies) config.headers['Cookie'] = sessionCookies;
 
-// مسار المشغل والمانفيست
-app.get('/play/:token/manifest.m3u8', async (req, res) => {
-    const { token } = req.params;
-    const decrypted = decryptShortToken(token);
+        const response = await axios.get(currentUrl, config);
+        if (response.headers['set-cookie']) {
+            sessionCookies = response.headers['set-cookie'].join('; ');
+        }
 
-    if (decrypted.error === 'Expired') {
-        return res.status(403).send('انتهت صلاحية هذا الرابط (عبر ساعتين).');
+        if ([301, 302, 303, 307, 308].includes(response.status)) {
+            const redirectLocation = response.headers['location'];
+            if (!redirectLocation) break;
+            currentUrl = new URL(redirectLocation, currentUrl).href;
+        } else {
+            return { data: response.data, finalUrl: currentUrl };
+        }
     }
-    if (decrypted.error === 'Invalid' || !decrypted.targetUrl) {
-        return res.status(400).send('رابط غير صالح.');
-    }
 
-    const targetUrl = decrypted.targetUrl;
+    const finalRes = await axios.get(currentUrl, {
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'http://orien.live/',
+            'Range': 'bytes=0-'
+        }
+    });
+    return { data: finalRes.data, finalUrl: currentUrl };
+}
+
+// مسار البث الثابت والدائم
+app.get(`/p/${CHANNEL_ID}`, async (req, res) => {
     const now = Date.now();
 
-    if (manifestCache.data && manifestCache.token === token && (now - manifestCache.timestamp < CACHE_TTL)) {
+    if (manifestCache.data && (now - manifestCache.timestamp < CACHE_TTL)) {
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         return res.send(manifestCache.data);
     }
@@ -112,25 +81,16 @@ app.get('/play/:token/manifest.m3u8', async (req, res) => {
             res.set('Content-Type', 'application/vnd.apple.mpegurl');
             return res.send(cachedData);
         } catch (e) {
-            return res.status(500).send('Error in pending request');
+            return res.status(500).send('Stream Error');
         }
     }
 
     pendingManifestPromise = (async () => {
         try {
-            const config = {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
-                    'Range': 'bytes=0-'
-                },
-                validateStatus: status => status >= 200 && status < 500
-            };
-
-            const response = await axios.get(targetUrl, config);
-            const finalUrl = response.request.res.responseUrl || targetUrl;
+            const { data, finalUrl } = await fetchAndResolveManifest();
             const baseUrl = new URL(finalUrl).origin;
 
-            let lines = response.data.split('\n');
+            let lines = data.split('\n');
             let rewrittenLines = lines.map(line => {
                 let trimmed = line.trim();
                 if (trimmed.startsWith('#') || !trimmed) return trimmed;
@@ -150,13 +110,7 @@ app.get('/play/:token/manifest.m3u8', async (req, res) => {
             });
 
             const finalManifest = rewrittenLines.join('\n');
-
-            manifestCache = {
-                data: finalManifest,
-                timestamp: Date.now(),
-                token: token
-            };
-
+            manifestCache = { data: finalManifest, timestamp: Date.now() };
             return finalManifest;
         } finally {
             pendingManifestPromise = null;
@@ -172,11 +126,11 @@ app.get('/play/:token/manifest.m3u8', async (req, res) => {
             res.set('Content-Type', 'application/vnd.apple.mpegurl');
             return res.send(manifestCache.data);
         }
-        res.status(500).send('Error fetching manifest');
+        res.status(500).send('Stream temporarily unavailable');
     }
 });
 
-// مسار البروكسي لقطع الفيديو .ts
+// مسار البروكسي لجلب قطع الفيديو .ts
 app.get('/proxy', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('No URL provided');
@@ -185,6 +139,7 @@ app.get('/proxy', async (req, res) => {
         const response = await axios.get(targetUrl, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+                'Referer': 'http://orien.live/',
                 'Range': 'bytes=0-'
             },
             responseType: 'stream',
@@ -202,6 +157,36 @@ app.get('/proxy', async (req, res) => {
     }
 });
 
+// الصفحة الرئيسية تعرض الرابط الثابت الجاهز
+app.get('/', (req, res) => {
+    const hostProtocol = req.protocol;
+    const hostName = req.get('host');
+    const permanentLink = `${hostProtocol}://${hostName}/p/${CHANNEL_ID}`;
+
+    res.send(`
+        <html dir="rtl" style="background:#0f172a;color:#fff;font-family:sans-serif;text-align:center;padding-top:40px;">
+            <h3>رابط البث الثابت والدائم (24 ساعة):</h3>
+            <input type="text" readonly value="${permanentLink}" style="width:80%;max-width:600px;padding:10px;background:#1e293b;border:1px solid #475569;color:#38bdf8;border-radius:6px;" onclick="this.select();">
+            <div style="margin-top:20px;">
+                <video id="player" width="640" controls autoplay playsinline style="border-radius:8px;background:#000;"></video>
+            </div>
+            <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+            <script>
+                const video = document.getElementById('player');
+                if (Hls.isSupported()) {
+                    const hls = new Hls();
+                    hls.loadSource('${permanentLink}');
+                    hls.attachMedia(video);
+                    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(()=>{}));
+                } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                    video.src = '${permanentLink}';
+                    video.play().catch(()=>{});
+                }
+            </script>
+        </html>
+    `);
+});
+
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`Streaming server running on port ${PORT}`);
 });

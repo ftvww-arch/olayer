@@ -2,7 +2,7 @@ const express = require('express');
 const axios = require('axios');
 const app = express();
 
-const STREAM_URL = 'https://afast-cdn1-liu.cdnz.quest/hls2/01/00070/k7i1jzwik4i0_,l,n,.urlset/master.m3u8?t=uP7Q5_Wgw-GKceYusu-uDWmn9UIMkj6qL6iVMEqgnY4&s=1788239082&e=18000&v=169417097&i=0.3&sp=0';
+const STREAM_URL = 'https://afast-cdn1-liu.cdnz.quest/hls2/01/00070/k7i1jzwik4i0_n/index-v1-a1.m3u8?t=4mGjShrsHVnrOWp-h6aNIcKwFTHvV1V3IA_sevyC4Ak&s=1788239623&e=18000&v=169417097&i=0.3&sp=0';
 
 // الترويسات المطلوبة لتجاوز حظر الـ CDN
 const CUSTOM_HEADERS = {

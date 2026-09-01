@@ -5,20 +5,15 @@ const compression = require('compression');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// تفعيل الضغط بناءً على الاعتماديات في package.json
 app.use(compression());
 
-// 1. معالجة طلبات Preflight (OPTIONS) الضرورية لتشغيل hls.js في المتصفحات بدون أخطاء CORS
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range');
     if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
-
-// متغير لتخزين الكوكيز (بعض السيرفرات تضع كوكيز عند توليد الـ Token)
-let sessionCookies = '';
 
 app.get('/proxy', async (req, res) => {
     const targetUrl = req.query.url;
@@ -27,25 +22,29 @@ app.get('/proxy', async (req, res) => {
     try {
         const config = {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
-                'Referer': 'http://orien.live/',
-                'Origin': 'http://orien.live',
-                'Accept': '*/*'
+                'Host': new URL(targetUrl).host,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+                'Accept': '*/*',
+                'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Range': 'bytes=0-',
+                'Referer': targetUrl
+            },
+            // منع Axios من إطلاق خطأ تلقائي مع بعض أكواد الحالة غير القياسية إن وجدت
+            validateStatus: function (status) {
+                return status >= 200 && status < 500; 
             }
         };
 
-        // إرفاق الكوكيز إذا تم استلامها من السيرفر في الطلبات السابقة
-        if (sessionCookies) config.headers['Cookie'] = sessionCookies;
+        const response = await axios.get(targetUrl, config);
 
-        // 2. معالجة قوائم التشغيل (.m3u8) سواء الأساسية أو الفرعية
+        if (response.status !== 200 && response.status !== 206) {
+            console.error(`Target responded with status ${response.status} for URL: ${targetUrl}`);
+            return res.status(response.status).send(`Target server error: ${response.status}`);
+        }
+
         if (targetUrl.includes('.m3u8')) {
-            const response = await axios.get(targetUrl, config);
-            
-            // التقاط الجلسة/الكوكيز بعد إعادة التوجيه (Redirect)
-            if (response.headers['set-cookie']) {
-                sessionCookies = response.headers['set-cookie'].join('; ');
-            }
-
             const finalUrl = response.request.res.responseUrl || targetUrl;
             const baseUrl = new URL(finalUrl).origin;
 
@@ -63,24 +62,24 @@ app.get('/proxy', async (req, res) => {
                     absoluteLink = new URL(trimmed, finalUrl).href;
                 }
 
-                // ترميز الرابط لضمان عدم ضياع المتغيرات (مثل Tokens) عند تمريرها
                 return `/proxy?url=${encodeURIComponent(absoluteLink)}`;
             });
 
             res.set('Content-Type', 'application/vnd.apple.mpegurl');
             return res.send(rewrittenLines.join('\n'));
-        } 
-        // 3. معالجة قطع الفيديو (.ts) وبثها مباشرة (Streaming) لتجنب استهلاك الذاكرة
-        else {
-            const response = await axios({
-                ...config,
+        } else {
+            const streamResponse = await axios({
                 method: 'GET',
                 url: targetUrl,
+                headers: config.headers,
                 responseType: 'stream'
             });
             
-            res.set('Content-Type', response.headers['content-type'] || 'video/MP2T');
-            return response.data.pipe(res);
+            res.set('Content-Type', streamResponse.headers['content-type'] || 'video/MP2T');
+            if (streamResponse.headers['content-range']) {
+                res.set('Content-Range', streamResponse.headers['content-range']);
+            }
+            return streamResponse.data.pipe(res);
         }
     } catch (error) {
         console.error(`[Proxy Error] ${targetUrl}:`, error.message);
@@ -88,10 +87,9 @@ app.get('/proxy', async (req, res) => {
     }
 });
 
-// واجهة المشغل
 app.get('/', (req, res) => {
-    // تمرير الرابط إلى البروكسي
-    const initialStream = 'http://orien.live/live/16304575049793/43581893985883/585734.m3u8';
+    // ضع رابط البث الكامل مع الـ Token هنا
+    const initialStream = 'http://89.33.13.177/live/16304575049793/43581893985883/585734.m3u8?token=aUdHbU.acXXydc.y.aUzdaby.yczHbdcU.X.y.TR.m3u8.400893ed4a1dcb1f9bc8504f26d7e5f13d29a85368613b78395517546617301c...b3JpZW4ubGl2ZQ==';
     const proxyStreamUrl = `/proxy?url=${encodeURIComponent(initialStream)}`;
 
     res.send(`
@@ -113,7 +111,6 @@ app.get('/', (req, res) => {
         const streamSrc = '${proxyStreamUrl}';
 
         if (Hls.isSupported()) {
-            // إعدادات إضافية لتحسين استقرار البث
             const hls = new Hls({ 
                 maxBufferLength: 30, 
                 maxMaxBufferLength: 60,

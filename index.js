@@ -7,7 +7,7 @@ const PORT = process.env.PORT || 3000;
 
 app.use(compression());
 
-// إعدادات CORS
+// إعدادات CORS للسماح للمشغل بالعمل من أي مكان
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -16,49 +16,42 @@ app.use((req, res, next) => {
     next();
 });
 
-// دوال مساعدة لتشفير وفك تشفير الهيدرز لتمريرها في الروابط بأمان
-function encodeHeaders(referer, userAgent) {
-    const payload = JSON.stringify({ r: referer, ua: userAgent });
-    return Buffer.from(payload).toString('base64url');
-}
+// الهيدرز الدقيقة التي يطلبها الـ Worker الخاص بهم ليعمل بدون حظر
+const WORKER_HEADERS = {
+    'Accept': '*/*',
+    'Accept-Encoding': 'gzip, deflate, br, zstd',
+    'Accept-Language': 'en-US,en;q=0.9,ar-JO;q=0.8,ar;q=0.7,tr-TR;q=0.6,tr;q=0.5',
+    'Origin': 'https://abody.optikl.ink',
+    'Referer': 'https://abody.optikl.ink/',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'cross-site'
+};
 
-function decodeHeaders(token) {
-    try {
-        const payload = Buffer.from(token, 'base64url').toString('utf8');
-        return JSON.parse(payload);
-    } catch (e) {
-        return null;
-    }
-}
+// رابط البروكسي (الـ Worker) الخاص بهم
+const WORKER_BASE_URL = 'https://website.fancy-water-8bf9.workers.dev/?stream=';
 
-// 1. مسار لجلب بيانات القناة وعرض مشغل الفيديو
+// 1. مسار جلب القناة وعرض المشغل
 app.get('/channel/:id', async (req, res) => {
     const { id } = req.params;
     try {
-        // جلب البيانات من الـ API الخاص بك
+        // نجلب رابط الـ m3u8 الأساسي من الـ API الخاص بهم
         const apiUrl = `https://website.fancy-water-8bf9.workers.dev/api/channel/${id}`;
-        const response = await axios.get(apiUrl);
+        const response = await axios.get(apiUrl, { headers: WORKER_HEADERS });
         
         const data = response.data.data && response.data.data[0];
         if (!data || !data.url) {
-            return res.status(404).send('لم يتم العثور على بيانات البث لهذه القناة.');
+            return res.status(404).send('لم يتم العثور على البث.');
         }
 
         const streamUrl = data.url;
-        // استخراج الهيدرز
-        const referer = data.headers?.Referer || data.referer || '';
-        const userAgent = data.headers?.['User-Agent'] || data.user_agent || '';
-
-        // تشفير الهيدرز لتمريرها للبروكسي
-        const headerToken = encodeHeaders(referer, userAgent);
-
         const hostProtocol = req.protocol;
         const hostName = req.get('host');
 
-        // إنشاء الرابط الخاص ببروكسي المانفيست
-        const manifestProxyUrl = `${hostProtocol}://${hostName}/proxy/manifest.m3u8?url=${encodeURIComponent(streamUrl)}&h=${headerToken}`;
+        // نوجه الرابط الأساسي لبروكسي المانفيست الخاص بنا
+        const manifestProxyUrl = `${hostProtocol}://${hostName}/proxy/manifest.m3u8?url=${encodeURIComponent(streamUrl)}`;
 
-        // إرجاع صفحة HTML تحتوي على مشغل فيديو مدمج (Hls.js)
         res.send(`
             <!DOCTYPE html>
             <html lang="ar" dir="rtl">
@@ -77,7 +70,6 @@ app.get('/channel/:id', async (req, res) => {
             <body>
                 <div class="info">
                     <h2>بث القناة رقم: ${id}</h2>
-                    <p>رابط البث المعالج (يمكنك استخدامه في تطبيقات IPTV):</p>
                     <input type="text" readonly value="${manifestProxyUrl}" onclick="this.select();">
                 </div>
                 <video id="video" controls autoplay></video>
@@ -89,15 +81,10 @@ app.get('/channel/:id', async (req, res) => {
                         const hls = new Hls();
                         hls.loadSource(videoSrc);
                         hls.attachMedia(video);
-                        hls.on(Hls.Events.MANIFEST_PARSED, function() {
-                            video.play();
-                        });
-                    }
-                    else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                        hls.on(Hls.Events.MANIFEST_PARSED, function() { video.play(); });
+                    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
                         video.src = videoSrc;
-                        video.addEventListener('loadedmetadata', function() {
-                            video.play();
-                        });
+                        video.addEventListener('loadedmetadata', function() { video.play(); });
                     }
                 </script>
             </body>
@@ -105,79 +92,74 @@ app.get('/channel/:id', async (req, res) => {
         `);
     } catch (error) {
         console.error('API Error:', error.message);
-        res.status(500).send('حدث خطأ أثناء جلب بيانات القناة.');
+        res.status(500).send('حدث خطأ أثناء جلب القناة.');
     }
 });
 
-// 2. بروكسي المانفيست (m3u8) - يقوم بجلب الملف الأساسي وتعديل الروابط داخله
+// 2. بروكسي المانفيست (يعتمد على الـ Worker الخاص بهم في الجلب)
 app.get('/proxy/manifest.m3u8', async (req, res) => {
     const targetUrl = req.query.url;
-    const headerToken = req.query.h;
-
-    if (!targetUrl || !headerToken) return res.status(400).send('Missing parameters');
-
-    const headersData = decodeHeaders(headerToken);
-    if (!headersData) return res.status(400).send('Invalid token');
+    if (!targetUrl) return res.status(400).send('Missing url');
 
     try {
-        const config = {
-            headers: {
-                'User-Agent': headersData.ua,
-                'Referer': headersData.r,
-                'Accept': '*/*'
-            },
-            maxRedirects: 5,
+        // نطلب ملف الـ m3u8 من خلال الـ Worker الخاص بهم لنتخطى الحظر
+        const fetchUrl = WORKER_BASE_URL + encodeURIComponent(targetUrl);
+        
+        const response = await axios.get(fetchUrl, {
+            headers: WORKER_HEADERS,
             validateStatus: status => status >= 200 && status < 500
-        };
-
-        const response = await axios.get(targetUrl, config);
-        const finalUrl = response.request.res.responseUrl || targetUrl;
+        });
 
         let lines = response.data.split('\n');
         let rewrittenLines = lines.map(line => {
             let trimmed = line.trim();
+            // تجاهل التعليقات والأسطر الفارغة
             if (trimmed.startsWith('#') || !trimmed) return trimmed;
 
-            // تحويل الروابط النسبية إلى روابط مطلقة بناءً على الرابط النهائي للمانفيست
-            let absoluteLink = new URL(trimmed, finalUrl).href;
+            // تحويل الروابط النسبية إلى مطلقة بناءً على الرابط المستهدف
+            let absoluteLink;
+            try {
+                absoluteLink = new URL(trimmed, targetUrl).href;
+            } catch (e) {
+                absoluteLink = trimmed;
+            }
 
             const hostProtocol = req.protocol;
             const hostName = req.get('host');
             
-            // إذا كان الرابط يشير لمانفيست فرعي (جودات متعددة)
+            // إعادة توجيه الروابط الداخلية (m3u8 أو js/ts) عبر البروكسي الخاص بنا
             if (absoluteLink.includes('.m3u8')) {
-                return `${hostProtocol}://${hostName}/proxy/manifest.m3u8?url=${encodeURIComponent(absoluteLink)}&h=${headerToken}`;
+                return `${hostProtocol}://${hostName}/proxy/manifest.m3u8?url=${encodeURIComponent(absoluteLink)}`;
             } else {
-                // إذا كان الرابط لقطعة فيديو (.ts) أو مفتاح تشفير
-                return `${hostProtocol}://${hostName}/proxy/segment?url=${encodeURIComponent(absoluteLink)}&h=${headerToken}`;
+                return `${hostProtocol}://${hostName}/proxy/segment?url=${encodeURIComponent(absoluteLink)}`;
             }
         });
 
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(rewrittenLines.join('\n'));
     } catch (error) {
-        console.error('Manifest Error:', error.message);
-        res.status(500).send('Error fetching manifest');
+        console.error('Manifest Proxy Error:', error.message);
+        res.status(500).send('Error proxying manifest');
     }
 });
 
-// 3. بروكسي قطع الفيديو (Segments) - يقوم بطلب الـ ts مع حقن الهيدرز 
+// 3. بروكسي قطع الفيديو (يطلب المقاطع بصيغة .js عبر الـ Worker الخاص بهم)
 app.get('/proxy/segment', async (req, res) => {
     const targetUrl = req.query.url;
-    const headerToken = req.query.h;
-
-    if (!targetUrl || !headerToken) return res.status(400).send('Missing parameters');
-
-    const headersData = decodeHeaders(headerToken);
-    if (!headersData) return res.status(400).send('Invalid token');
+    if (!targetUrl) return res.status(400).send('Missing url');
 
     try {
-        const response = await axios.get(targetUrl, {
-            headers: {
-                'User-Agent': headersData.ua,
-                'Referer': headersData.r,
-                'Range': req.headers.range || 'bytes=0-' // لدعم التنقل داخل الفيديو
-            },
+        // توجيه الطلب إلى الـ Worker الخاص بهم 
+        const fetchUrl = WORKER_BASE_URL + encodeURIComponent(targetUrl);
+        
+        // تجهيز الهيدرز ودعم الـ Range للتنقل داخل الفيديو
+        const headers = { ...WORKER_HEADERS };
+        if (req.headers.range) {
+            headers['Range'] = req.headers.range;
+        }
+
+        const response = await axios.get(fetchUrl, {
+            headers: headers,
             responseType: 'stream',
             validateStatus: status => status >= 200 && status < 500
         });
@@ -185,18 +167,18 @@ app.get('/proxy/segment', async (req, res) => {
         res.set('Access-Control-Allow-Origin', '*');
         res.set('Content-Type', response.headers['content-type'] || 'video/MP2T');
         
-        // تمرير هيدرز الرينج (Range) ليعمل المشغل بشكل صحيح
         if (response.headers['content-range']) res.set('Content-Range', response.headers['content-range']);
         if (response.headers['content-length']) res.set('Content-Length', response.headers['content-length']);
         if (response.headers['accept-ranges']) res.set('Accept-Ranges', response.headers['accept-ranges']);
 
+        // دفق (Pipe) الفيديو للمشغل
         response.data.pipe(res);
     } catch (error) {
-        console.error('Segment Error:', error.message);
-        res.status(500).send('Error fetching segment');
+        console.error('Segment Proxy Error:', error.message);
+        res.status(500).send('Error proxying segment');
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
+    console.log(`Server running smoothly on port ${PORT}`);
 });

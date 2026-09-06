@@ -5,12 +5,12 @@ const compression = require('compression');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// تفعيل Trust Proxy لدعم HTTPS على منصات مثل Render
+// تفعيل Trust Proxy لتحديد البروتوكول (HTTP/HTTPS) بدقة على منصات السحاب مثل Render
 app.enable('trust proxy');
 
 app.use(compression());
 
-// إعدادات CORS
+// إعدادات CORS للسماح بالتشغيل على جميع المتصفحات والمشغلات
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -19,12 +19,12 @@ app.use((req, res, next) => {
     next();
 });
 
-// ذاكرة التخزين المؤقت (الكاش)
+// ذاكرة التخزين المؤقت (الكاش) وقفل الطلبات النشطة لمنع الضغط على المصدر
 const manifestCache = new Map();
 const segmentCache = new Map();
 const activeRequests = new Map();
 
-// الترويسات الخاصة بتخطي الحماية
+// الترويسات لمطابقة طلب المتصفح وتخطي الحماية
 const WORKER_HEADERS = {
     'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9,ar-JO;q=0.8,ar;q=0.7',
@@ -42,29 +42,38 @@ const WORKER_HEADERS = {
 
 const WORKER_BASE_URL = 'https://website.fancy-water-8bf9.workers.dev/?stream=';
 
-// دالة مساعدة للحصول على رابط السيرفر الصحيح (HTTP/HTTPS)
+// دالة لمعرفة النطاق والبروتوكول الحالي تلقائياً
 function getBaseUrl(req) {
     const protocol = req.headers['x-forwarded-proto'] || req.protocol;
     const host = req.get('host');
     return `${protocol}://${host}`;
 }
 
-// 1. رابط مختصر ومباشر للبث (تأكد من وضع التوكين الكامل هنا بدون ...)
+// 1. مسار مباشر ومختصر للبث (ضع التوكين الكامل هنا بدون نقاط ...)
 app.get('/my-live-stream.m3u8', (req, res) => {
     const targetUrl = 'http://89.33.13.177/live/16304575049793/43581893985883/405949.m3u8?token=aUdHbU.fHydHUc.y.fdyzyzz.yczHbdcU.X.y.TR.m3u8.0162a828a5a29c1ac98634a2c8d976ed220e4745eae144c9ea2f4d217fea4fb8...b3JpZW4ubGl2ZQ==';
     res.redirect(`/proxy/manifest.m3u8?url=${encodeURIComponent(targetUrl)}`);
 });
 
-// 2. بروكسي المانفيست مع الكاش
+// 2. بروكسي المانفيست مع الكاش ومعالجة التوكين المباشرة
 app.get('/proxy/manifest.m3u8', async (req, res) => {
-    const targetUrl = req.query.url;
-    if (!targetUrl) return res.status(400).send('Missing url');
+    // التقاط الرابط الكامل بعد ?url= حتى لو احتوى على علامت ? ثانية داخل التوكين
+    let targetUrl = req.originalUrl.split('/proxy/manifest.m3u8?url=')[1];
+    if (!targetUrl) return res.status(400).send('Missing url parameter');
 
+    try {
+        targetUrl = decodeURIComponent(targetUrl);
+    } catch (e) {
+        // في حال كان الرابط فك تشفيره مسبقاً
+    }
+
+    // إرجاع النتيجة مباشرة إذا كانت مخزنة في الكاش
     if (manifestCache.has(targetUrl)) {
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         return res.send(manifestCache.get(targetUrl));
     }
 
+    // انتشال الطلب الجاري لتجنب التكرار بنفس اللحظة من مشاهدين آخرين
     if (activeRequests.has(targetUrl)) {
         try {
             const data = await activeRequests.get(targetUrl);
@@ -85,7 +94,7 @@ app.get('/proxy/manifest.m3u8', async (req, res) => {
             });
 
             if (response.status !== 200) {
-                throw new Error(`Upstream manifest status: ${response.status}`);
+                throw new Error(`Upstream server error: HTTP ${response.status}`);
             }
 
             const finalUrl = response.request?.res?.responseUrl || targetUrl;
@@ -114,6 +123,8 @@ app.get('/proxy/manifest.m3u8', async (req, res) => {
             });
 
             const processedManifest = rewrittenLines.join('\n');
+
+            // حفظ المانفيست في الكاش لمدة 3 ثواني
             manifestCache.set(targetUrl, processedManifest);
             setTimeout(() => manifestCache.delete(targetUrl), 3000);
 
@@ -131,15 +142,22 @@ app.get('/proxy/manifest.m3u8', async (req, res) => {
         res.send(data);
     } catch (error) {
         console.error('Manifest Error:', error.message);
-        res.status(500).send('Error proxying manifest');
+        res.status(500).send('Error proxying manifest: ' + error.message);
     }
 });
 
-// 3. بروكسي قطع الفيديو مع الكاش
+// 3. بروكسي القطع مع الكاش لمنع استهلاك السيرفر الأصلي
 app.get('/proxy/segment', async (req, res) => {
-    const targetUrl = req.query.url;
-    if (!targetUrl) return res.status(400).send('Missing url');
+    let targetUrl = req.originalUrl.split('/proxy/segment?url=')[1];
+    if (!targetUrl) return res.status(400).send('Missing url parameter');
 
+    try {
+        targetUrl = decodeURIComponent(targetUrl);
+    } catch (e) {
+        // في حال كان الرابط غير مشفر
+    }
+
+    // جلب القطعة من الكاش إذا كانت موجودة
     if (segmentCache.has(targetUrl)) {
         const cached = segmentCache.get(targetUrl);
         res.set('Access-Control-Allow-Origin', '*');
@@ -147,6 +165,7 @@ app.get('/proxy/segment', async (req, res) => {
         return res.send(cached.data);
     }
 
+    // في حال كانت القطعة تُحمل حالياً، يربط بقية المشاهدين بنفس الطلب
     if (activeRequests.has(targetUrl)) {
         try {
             const cached = await activeRequests.get(targetUrl);
@@ -168,13 +187,14 @@ app.get('/proxy/segment', async (req, res) => {
             });
 
             if (response.status !== 200) {
-                throw new Error(`Upstream segment status: ${response.status}`);
+                throw new Error(`Upstream segment error: HTTP ${response.status}`);
             }
 
             const contentType = response.headers['content-type'] || 'video/MP2T';
             const bufferData = Buffer.from(response.data);
             const result = { data: bufferData, contentType };
 
+            // تخزين القطعة لمدة 60 ثانية لخدمة جميع المشاهدين الآخرين
             segmentCache.set(targetUrl, result);
             setTimeout(() => segmentCache.delete(targetUrl), 60000);
 
@@ -193,10 +213,10 @@ app.get('/proxy/segment', async (req, res) => {
         res.send(cached.data);
     } catch (error) {
         console.error('Segment Error:', error.message);
-        res.status(500).send('Error proxying segment');
+        res.status(500).send('Error proxying segment: ' + error.message);
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`Server running smoothly on port ${PORT}`);
 });

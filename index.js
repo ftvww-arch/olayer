@@ -1,20 +1,60 @@
-// --- إعدادات الكاش ---
-const manifestCache = new Map(); // لتخزين المانفيست
-const segmentCache = new Map(); // لتخزين قطع الفيديو
-const activeRequests = new Map(); // لمنع تكرار الطلب للمصدر في نفس اللحظة (Cache Stampede)
+const express = require('express');
+const axios = require('axios');
+const compression = require('compression');
 
-// 2. بروكسي المانفيست مع دعم مفاتيح التشفير (محدث مع كاش)
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(compression());
+
+// إعدادات CORS
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range');
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    next();
+});
+
+// ذاكرة التخزين المؤقت (الكاش)
+const manifestCache = new Map();
+const segmentCache = new Map();
+const activeRequests = new Map();
+
+// الترويسات الخاصة بتخطي الحماية
+const WORKER_HEADERS = {
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9,ar-JO;q=0.8,ar;q=0.7',
+    'Origin': 'https://abody.optikl.ink',
+    'Referer': 'https://abody.optikl.ink/',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+    'Priority': 'u=1, i',
+    'sec-ch-ua': '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'cross-site'
+};
+
+const WORKER_BASE_URL = 'https://website.fancy-water-8bf9.workers.dev/?stream=';
+
+// 1. رابط مختصر ومباشر للبث
+app.get('/my-live-stream.m3u8', (req, res) => {
+    const targetUrl = 'http://89.33.13.177/live/16304575049793/43581893985883/405949.m3u8?token=aUdHbU.fHydHUc.y.fdyzyzz.yczHbdcU.X.y.TR.m3u8.0162a828a5a29c1ac98634a2c8d976ed220e4745eae144c9ea2f4d217fea4fb8...b3JpZW4ubGl2ZQ==';
+    res.redirect(`/proxy/manifest.m3u8?url=${encodeURIComponent(targetUrl)}`);
+});
+
+// 2. بروكسي المانفيست مع الكاش
 app.get('/proxy/manifest.m3u8', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Missing url');
 
-    // التحقق إذا كان المانفيست موجود في الكاش (صالح لمدة ثانيتين للبث المباشر)
     if (manifestCache.has(targetUrl)) {
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         return res.send(manifestCache.get(targetUrl));
     }
 
-    // إذا كان هناك طلب جاري حالياً لنفس الرابط، انتظر حتى ينتهي
     if (activeRequests.has(targetUrl)) {
         const data = await activeRequests.get(targetUrl);
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
@@ -57,19 +97,17 @@ app.get('/proxy/manifest.m3u8', async (req, res) => {
             });
 
             const processedManifest = rewrittenLines.join('\n');
-            
-            // حفظ في الكاش لمدة 3 ثواني (المانفيست يتحدث باستمرار في البث المباشر)
             manifestCache.set(targetUrl, processedManifest);
             setTimeout(() => manifestCache.delete(targetUrl), 3000);
 
             return processedManifest;
         } finally {
-            activeRequests.delete(targetUrl); // إزالة القفل بعد الانتهاء
+            activeRequests.delete(targetUrl);
         }
     })();
 
     activeRequests.set(targetUrl, fetchPromise);
-    
+
     try {
         const data = await fetchPromise;
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
@@ -80,19 +118,17 @@ app.get('/proxy/manifest.m3u8', async (req, res) => {
     }
 });
 
-// 3. بروكسي قطع الفيديو (محدث مع كاش في الذاكرة لتخفيف الضغط)
+// 3. بروكسي قطع الفيديو مع الكاش
 app.get('/proxy/segment', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Missing url');
 
-    // التحقق من الكاش (القطع لا تتغير، لذا نحفظها لمدة أطول)
     if (segmentCache.has(targetUrl)) {
         res.set('Access-Control-Allow-Origin', '*');
         res.set('Content-Type', 'video/MP2T');
         return res.send(segmentCache.get(targetUrl));
     }
 
-    // إذا كان المقطع يتم تحميله الآن بواسطة مستخدم آخر، اجعل هذا المستخدم ينتظر
     if (activeRequests.has(targetUrl)) {
         const data = await activeRequests.get(targetUrl);
         res.set('Access-Control-Allow-Origin', '*');
@@ -103,18 +139,14 @@ app.get('/proxy/segment', async (req, res) => {
     const fetchPromise = (async () => {
         try {
             const fetchUrl = WORKER_BASE_URL + encodeURIComponent(targetUrl);
-            
-            // نستخدم arraybuffer لحفظ البيانات في الذاكرة بسهولة
             const response = await axios.get(fetchUrl, {
                 headers: WORKER_HEADERS,
-                responseType: 'arraybuffer', 
+                responseType: 'arraybuffer',
                 decompress: false,
                 validateStatus: status => status >= 200 && status < 500
             });
 
             const bufferData = Buffer.from(response.data);
-
-            // حفظ المقطع في الكاش لمدة 60 ثانية (كافية جداً للبث المباشر)
             segmentCache.set(targetUrl, bufferData);
             setTimeout(() => segmentCache.delete(targetUrl), 60000);
 
@@ -135,4 +167,8 @@ app.get('/proxy/segment', async (req, res) => {
         console.error('Segment Error:', error.message);
         res.status(500).send('Error proxying segment');
     }
+});
+
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
 });

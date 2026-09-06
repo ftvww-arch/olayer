@@ -5,6 +5,9 @@ const compression = require('compression');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// تفعيل Trust Proxy لدعم HTTPS على منصات مثل Render
+app.enable('trust proxy');
+
 app.use(compression());
 
 // إعدادات CORS
@@ -39,7 +42,14 @@ const WORKER_HEADERS = {
 
 const WORKER_BASE_URL = 'https://website.fancy-water-8bf9.workers.dev/?stream=';
 
-// 1. رابط مختصر ومباشر للبث
+// دالة مساعدة للحصول على رابط السيرفر الصحيح (HTTP/HTTPS)
+function getBaseUrl(req) {
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+    const host = req.get('host');
+    return `${protocol}://${host}`;
+}
+
+// 1. رابط مختصر ومباشر للبث (تأكد من وضع التوكين الكامل هنا بدون ...)
 app.get('/my-live-stream.m3u8', (req, res) => {
     const targetUrl = 'http://89.33.13.177/live/16304575049793/43581893985883/405949.m3u8?token=aUdHbU.fHydHUc.y.fdyzyzz.yczHbdcU.X.y.TR.m3u8.0162a828a5a29c1ac98634a2c8d976ed220e4745eae144c9ea2f4d217fea4fb8...b3JpZW4ubGl2ZQ==';
     res.redirect(`/proxy/manifest.m3u8?url=${encodeURIComponent(targetUrl)}`);
@@ -56,9 +66,13 @@ app.get('/proxy/manifest.m3u8', async (req, res) => {
     }
 
     if (activeRequests.has(targetUrl)) {
-        const data = await activeRequests.get(targetUrl);
-        res.set('Content-Type', 'application/vnd.apple.mpegurl');
-        return res.send(data);
+        try {
+            const data = await activeRequests.get(targetUrl);
+            res.set('Content-Type', 'application/vnd.apple.mpegurl');
+            return res.send(data);
+        } catch (e) {
+            return res.status(500).send('Error fetching manifest');
+        }
     }
 
     const fetchPromise = (async () => {
@@ -70,9 +84,12 @@ app.get('/proxy/manifest.m3u8', async (req, res) => {
                 validateStatus: status => status >= 200 && status < 500
             });
 
+            if (response.status !== 200) {
+                throw new Error(`Upstream manifest status: ${response.status}`);
+            }
+
             const finalUrl = response.request?.res?.responseUrl || targetUrl;
-            const hostProtocol = req.protocol;
-            const hostName = req.get('host');
+            const baseUrl = getBaseUrl(req);
 
             let lines = response.data.split('\n');
             let rewrittenLines = lines.map(line => {
@@ -81,7 +98,7 @@ app.get('/proxy/manifest.m3u8', async (req, res) => {
                     if (trimmed.includes('URI="')) {
                         return trimmed.replace(/URI="(.*?)"/g, (match, p1) => {
                             let absKeyUrl = new URL(p1, finalUrl).href;
-                            return `URI="${hostProtocol}://${hostName}/proxy/segment?url=${encodeURIComponent(absKeyUrl)}"`;
+                            return `URI="${baseUrl}/proxy/segment?url=${encodeURIComponent(absKeyUrl)}"`;
                         });
                     }
                     return trimmed;
@@ -90,9 +107,9 @@ app.get('/proxy/manifest.m3u8', async (req, res) => {
 
                 let absoluteLink = new URL(trimmed, finalUrl).href;
                 if (absoluteLink.includes('.m3u8')) {
-                    return `${hostProtocol}://${hostName}/proxy/manifest.m3u8?url=${encodeURIComponent(absoluteLink)}`;
+                    return `${baseUrl}/proxy/manifest.m3u8?url=${encodeURIComponent(absoluteLink)}`;
                 } else {
-                    return `${hostProtocol}://${hostName}/proxy/segment?url=${encodeURIComponent(absoluteLink)}`;
+                    return `${baseUrl}/proxy/segment?url=${encodeURIComponent(absoluteLink)}`;
                 }
             });
 
@@ -124,16 +141,21 @@ app.get('/proxy/segment', async (req, res) => {
     if (!targetUrl) return res.status(400).send('Missing url');
 
     if (segmentCache.has(targetUrl)) {
+        const cached = segmentCache.get(targetUrl);
         res.set('Access-Control-Allow-Origin', '*');
-        res.set('Content-Type', 'video/MP2T');
-        return res.send(segmentCache.get(targetUrl));
+        res.set('Content-Type', cached.contentType || 'video/MP2T');
+        return res.send(cached.data);
     }
 
     if (activeRequests.has(targetUrl)) {
-        const data = await activeRequests.get(targetUrl);
-        res.set('Access-Control-Allow-Origin', '*');
-        res.set('Content-Type', 'video/MP2T');
-        return res.send(data);
+        try {
+            const cached = await activeRequests.get(targetUrl);
+            res.set('Access-Control-Allow-Origin', '*');
+            res.set('Content-Type', cached.contentType || 'video/MP2T');
+            return res.send(cached.data);
+        } catch (e) {
+            return res.status(500).send('Error fetching segment');
+        }
     }
 
     const fetchPromise = (async () => {
@@ -142,15 +164,21 @@ app.get('/proxy/segment', async (req, res) => {
             const response = await axios.get(fetchUrl, {
                 headers: WORKER_HEADERS,
                 responseType: 'arraybuffer',
-                decompress: false,
                 validateStatus: status => status >= 200 && status < 500
             });
 
+            if (response.status !== 200) {
+                throw new Error(`Upstream segment status: ${response.status}`);
+            }
+
+            const contentType = response.headers['content-type'] || 'video/MP2T';
             const bufferData = Buffer.from(response.data);
-            segmentCache.set(targetUrl, bufferData);
+            const result = { data: bufferData, contentType };
+
+            segmentCache.set(targetUrl, result);
             setTimeout(() => segmentCache.delete(targetUrl), 60000);
 
-            return bufferData;
+            return result;
         } finally {
             activeRequests.delete(targetUrl);
         }
@@ -159,10 +187,10 @@ app.get('/proxy/segment', async (req, res) => {
     activeRequests.set(targetUrl, fetchPromise);
 
     try {
-        const data = await fetchPromise;
+        const cached = await fetchPromise;
         res.set('Access-Control-Allow-Origin', '*');
-        res.set('Content-Type', 'video/MP2T');
-        res.send(data);
+        res.set('Content-Type', cached.contentType);
+        res.send(cached.data);
     } catch (error) {
         console.error('Segment Error:', error.message);
         res.status(500).send('Error proxying segment');

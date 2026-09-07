@@ -2,27 +2,109 @@ const express = require('express');
 const axios = require('axios');
 const compression = require('compression');
 const crypto = require('crypto');
+const http = require('http');
+const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 const SECRET_KEY = process.env.SECRET_KEY || 'my-super-secret-streaming-key-2026';
-const TOKEN_EXPIRY_HOURS = 2; // صلاحية الساعتين
+const TOKEN_EXPIRY_HOURS = 2; // صلاحية الرابط المشفر
 
-// إعدادات الكاش
-const MANIFEST_CACHE_TTL = 4000; // 4 ثوانٍ لملفات m3u8 (لأن البث المباشر يتحدث باستمرار)
-const TS_CACHE_TTL = 60000; // 60 ثانية لقطع الفيديو .ts (لأنها ثابتة ولا تتغير)
-const MAX_TS_CACHE_ITEMS = 500; // الحد الأقصى لعدد قطع الفيديو في الذاكرة لحماية الرام
-
-// خرائط التخزين المؤقت والطلبات المعلقة (Request Coalescing)
-const manifestCache = new Map();     // لتخزين بيانات m3u8
-const manifestPromises = new Map();  // لتخزين الطلبات التي قيد التنفيذ حالياً لـ m3u8
-
-const tsCache = new Map();           // لتخزين بيانات قطع الفيديو (Buffers)
-const tsPromises = new Map();        // لتخزين الطلبات التي قيد التنفيذ حالياً لـ ts
+// ==========================================
+// 1. نظام الحماية الذكي للاتصالات (Single Socket Enforcement)
+// ==========================================
+// نحدد maxSockets: 1 لضمان أن السيرفر لن يفتح أكثر من اتصال واحد نهائياً نحو السيرفر الأصلي
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 1, keepAliveMsecs: 10000 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 1, keepAliveMsecs: 10000 });
 
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36';
 
+const axiosInstance = axios.create({
+    httpAgent,
+    httpsAgent,
+    timeout: 7000, // مهلة 7 ثوانٍ لعدم تعليق الطلبات
+    headers: { 'User-Agent': USER_AGENT }
+});
+
+// ==========================================
+// 2. كلاس الكاش الذكي (LRU + TTL + Auto Clean)
+// ==========================================
+class SmartCache {
+    constructor(maxItems = 300, defaultTtlMs = 60000) {
+        this.maxItems = maxItems;
+        this.defaultTtlMs = defaultTtlMs;
+        this.cache = new Map();
+    }
+
+    get(key) {
+        if (!this.cache.has(key)) return null;
+        const item = this.cache.get(key);
+        if (Date.now() > item.expiresAt) {
+            this.cache.delete(key); // حذف التلقائي عند انتهاء الصلاحية
+            return null;
+        }
+        // تجديد الترتيب لضمان خروج أقدم العناصر (LRU)
+        this.cache.delete(key);
+        this.cache.set(key, item);
+        return item.data;
+    }
+
+    // استرجاع الكاش القديم عند انقطاع البث الأصلي بدلاً من إظهار خطأ للمستخدم
+    getStale(key) {
+        if (!this.cache.has(key)) return null;
+        return this.cache.get(key).data;
+    }
+
+    set(key, data, ttlMs = this.defaultTtlMs) {
+        if (this.cache.has(key)) {
+            this.cache.delete(key);
+        } else if (this.cache.size >= this.maxItems) {
+            // حذف أقدم عنصر عند الامتلاء للحفاظ على الذاكرة
+            const oldestKey = this.cache.keys().next().value;
+            this.cache.delete(oldestKey);
+        }
+        this.cache.set(key, {
+            data,
+            expiresAt: Date.now() + ttlMs
+        });
+    }
+
+    delete(key) {
+        this.cache.delete(key);
+    }
+}
+
+// تهيئة الكاش للبث المباشر
+// m3u8: كاش مدته 3 ثوانٍ وحجم أقصى 50 رابط
+const manifestCache = new SmartCache(50, 3000); 
+// .ts: كاش مدته 45 ثانية وحجم أقصى 400 قطعة فيديو (تتصفى تلقائياً)
+const tsCache = new SmartCache(400, 45000);
+
+// خرائط الطلبات المعلقة (Request Coalescing)
+const manifestPromises = new Map();
+const tsPromises = new Map();
+
+// نظام فترة التهدئة لمنع حظر السيرفر الأصلي عند حدوث أخطاء
+const cooldowns = new Map(); // targetUrl -> timestamp
+
+function isCoolingDown(url) {
+    const until = cooldowns.get(url);
+    if (!until) return false;
+    if (Date.now() > until) {
+        cooldowns.delete(url);
+        return false;
+    }
+    return true;
+}
+
+function setCooldown(url, durationMs = 4000) {
+    cooldowns.set(url, Date.now() + durationMs);
+}
+
+// ==========================================
+// 3. إعدادات Express وإجراءات التشفير
+// ==========================================
 app.use(compression());
 
 app.use((req, res, next) => {
@@ -33,7 +115,6 @@ app.use((req, res, next) => {
     next();
 });
 
-// دالة لتوليد توكن مشفر
 function generateShortToken(targetUrl) {
     const expiresAt = Date.now() + (TOKEN_EXPIRY_HOURS * 60 * 60 * 1000);
     const payload = JSON.stringify({ url: targetUrl, exp: expiresAt });
@@ -47,29 +128,23 @@ function generateShortToken(targetUrl) {
     return `${base64Payload}.${signature}`;
 }
 
-// دالة فحص التوكن
 function decryptShortToken(token) {
     try {
         const parts = token.split('.');
         if (parts.length !== 2) return { error: 'Invalid' };
         
         const [base64Payload, signature] = parts;
-        
         const expectedSignature = crypto
             .createHmac('sha256', SECRET_KEY)
             .update(base64Payload)
             .digest('hex');
             
-        if (signature !== expectedSignature) {
-            return { error: 'Invalid' };
-        }
+        if (signature !== expectedSignature) return { error: 'Invalid' };
         
         const payloadJson = Buffer.from(base64Payload, 'base64url').toString('utf8');
         const { url, exp } = JSON.parse(payloadJson);
         
-        if (Date.now() > exp) {
-            return { error: 'Expired' };
-        }
+        if (Date.now() > exp) return { error: 'Expired' };
         
         return { targetUrl: url };
     } catch (e) {
@@ -78,30 +153,38 @@ function decryptShortToken(token) {
 }
 
 // ==========================================
-// قلب النظام: مدير جلب وتخزين ملفات Manifest
+// 4. دالة جلب وتعديل الـ Manifest الموحدة
 // ==========================================
 async function fetchAndRewriteManifest(targetUrl, req) {
-    // 1. هل النتيجة موجودة في الكاش وصالحة؟
-    if (manifestCache.has(targetUrl)) {
-        const cached = manifestCache.get(targetUrl);
-        if (Date.now() < cached.expireTime) return cached.data;
-    }
+    // أ. فحص الكاش النشط
+    const cachedData = manifestCache.get(targetUrl);
+    if (cachedData) return cachedData;
 
-    // 2. هل هناك طلب يتم جلبه الآن؟ (لو 1000 شخص طلبوا معاً، 999 سينتظرون هنا)
+    // ب. دمج الطلبات المتزامنة (1000 شخص ينتظرون طلب واحد)
     if (manifestPromises.has(targetUrl)) {
         return manifestPromises.get(targetUrl);
     }
 
-    // 3. إنشاء طلب جديد للسيرفر الأصلي (سيتم تنفيذه مرة واحدة فقط)
+    // ج. فحص إذا كان السيرفر الأصلي في حالة تهدئة بسبب خطأ سابق
+    if (isCoolingDown(targetUrl)) {
+        const stale = manifestCache.getStale(targetUrl);
+        if (stale) return stale;
+        throw new Error('Origin server on cooldown');
+    }
+
     const promise = (async () => {
         try {
-            const response = await axios.get(targetUrl, {
-                headers: { 'User-Agent': USER_AGENT },
-                maxRedirects: 10,
+            const response = await axiosInstance.get(targetUrl, {
+                maxRedirects: 5,
                 validateStatus: status => status >= 200 && status < 500
             });
 
-            if (typeof response.data !== 'string') throw new Error('Invalid manifest data');
+            if (response.status >= 400 || typeof response.data !== 'string') {
+                setCooldown(targetUrl, 3000);
+                const stale = manifestCache.getStale(targetUrl);
+                if (stale) return stale;
+                throw new Error(`Origin error HTTP ${response.status}`);
+            }
 
             const finalUrl = response.request.res.responseUrl || targetUrl;
             const baseUrl = new URL(finalUrl).origin;
@@ -121,12 +204,15 @@ async function fetchAndRewriteManifest(targetUrl, req) {
             });
 
             const finalManifest = rewrittenLines.join('\n');
-            
-            // حفظ النتيجة في الكاش
-            manifestCache.set(targetUrl, { data: finalManifest, expireTime: Date.now() + MANIFEST_CACHE_TTL });
+            manifestCache.set(targetUrl, finalManifest, 3000); // كاش 3 ثوانٍ للبث المباشر
             return finalManifest;
+
+        } catch (error) {
+            setCooldown(targetUrl, 4000);
+            const stale = manifestCache.getStale(targetUrl);
+            if (stale) return stale;
+            throw error;
         } finally {
-            // مسح الوعد بعد الانتهاء لكي يتم عمل طلب جديد عند انتهاء الكاش
             manifestPromises.delete(targetUrl);
         }
     })();
@@ -136,25 +222,28 @@ async function fetchAndRewriteManifest(targetUrl, req) {
 }
 
 // ==========================================
-// قلب النظام: مدير جلب وتخزين قطع الفيديو TS
+// 5. دالة جلب قطع الفيديو .TS الموحدة
 // ==========================================
 async function fetchSegment(targetUrl) {
-    if (tsCache.has(targetUrl)) {
-        const cached = tsCache.get(targetUrl);
-        if (Date.now() < cached.expireTime) return cached;
-    }
+    const cachedSegment = tsCache.get(targetUrl);
+    if (cachedSegment) return cachedSegment;
 
     if (tsPromises.has(targetUrl)) {
         return tsPromises.get(targetUrl);
     }
 
+    if (isCoolingDown(targetUrl)) {
+        const stale = tsCache.getStale(targetUrl);
+        if (stale) return stale;
+        throw new Error('Origin segment on cooldown');
+    }
+
     const promise = (async () => {
         try {
-            const response = await axios.get(targetUrl, {
-                headers: { 'User-Agent': USER_AGENT },
-                responseType: 'arraybuffer', // تحميل الملف بالكامل إلى الذاكرة
-                maxRedirects: 5,
-                validateStatus: status => status >= 200 && status < 500
+            const response = await axiosInstance.get(targetUrl, {
+                responseType: 'arraybuffer',
+                maxRedirects: 3,
+                validateStatus: status => status >= 200 && status < 300
             });
 
             const result = {
@@ -162,18 +251,14 @@ async function fetchSegment(targetUrl) {
                 contentType: response.headers['content-type'] || 'video/MP2T'
             };
 
-            // حماية الذاكرة (RAM): إذا زاد الكاش عن الحد، نحذف أقدم ملف
-            if (tsCache.size >= MAX_TS_CACHE_ITEMS) {
-                const oldestKey = tsCache.keys().next().value;
-                tsCache.delete(oldestKey);
-            }
-
-            tsCache.set(targetUrl, { ...result, expireTime: Date.now() + TS_CACHE_TTL });
-
-            // حذف الملف من الذاكرة تلقائياً بعد مرور الوقت
-            setTimeout(() => { tsCache.delete(targetUrl); }, TS_CACHE_TTL);
-
+            tsCache.set(targetUrl, result, 45000); // الاحتفاظ لمدة 45 ثانية في الكاش
             return result;
+
+        } catch (error) {
+            setCooldown(targetUrl, 3000);
+            const stale = tsCache.getStale(targetUrl);
+            if (stale) return stale;
+            throw error;
         } finally {
             tsPromises.delete(targetUrl);
         }
@@ -184,7 +269,7 @@ async function fetchSegment(targetUrl) {
 }
 
 // ==========================================
-// المسارات (Routes)
+// 6. المسارات (Routes)
 // ==========================================
 
 app.get('/generate', (req, res) => {
@@ -203,12 +288,12 @@ app.get('/generate', (req, res) => {
     `);
 });
 
-// مسار المشغل والمانفيست (بالتوكن)
+// مسار المانفيست بالتوكن
 app.get('/play/:token/manifest.m3u8', async (req, res) => {
     const { token } = req.params;
     const decrypted = decryptShortToken(token);
 
-    if (decrypted.error === 'Expired') return res.status(403).send('انتهت صلاحية هذا الرابط (عبر ساعتين).');
+    if (decrypted.error === 'Expired') return res.status(403).send('انتهت صلاحية هذا الرابط.');
     if (decrypted.error === 'Invalid' || !decrypted.targetUrl) return res.status(400).send('رابط غير صالح.');
 
     try {
@@ -216,11 +301,11 @@ app.get('/play/:token/manifest.m3u8', async (req, res) => {
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(manifest);
     } catch (error) {
-        res.status(500).send('Error fetching manifest');
+        res.status(500).send('Stream error or server on cooldown');
     }
 });
 
-// مسار مباشر ودائم بدون توكن
+// مسار المانفيست المباشر
 app.get('/direct/manifest.m3u8', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Please provide a ?url=...');
@@ -230,11 +315,11 @@ app.get('/direct/manifest.m3u8', async (req, res) => {
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(manifest);
     } catch (error) {
-        res.status(500).send('Error fetching direct manifest');
+        res.status(500).send('Direct stream fetch error');
     }
 });
 
-// مسار البروكسي لقطع الفيديو .ts (مع الكاش!)
+// مسار البروكسي لقطع TS
 app.get('/proxy', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('No URL provided');
@@ -242,13 +327,12 @@ app.get('/proxy', async (req, res) => {
     try {
         const segment = await fetchSegment(targetUrl);
         res.set('Content-Type', segment.contentType);
-        // نرسل البيانات مباشرة من الذاكرة
         res.send(segment.buffer);
     } catch (error) {
-        res.status(500).send('Proxy Error');
+        res.status(500).send('Proxy Segment Error');
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`Smart Ultra Proxy running on port ${PORT}`);
 });

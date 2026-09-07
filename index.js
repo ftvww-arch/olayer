@@ -9,6 +9,20 @@ const PORT = process.env.PORT || 3000;
 const SECRET_KEY = process.env.SECRET_KEY || 'my-super-secret-streaming-key-2026';
 const TOKEN_EXPIRY_HOURS = 2; // صلاحية الساعتين
 
+// إعدادات الكاش
+const MANIFEST_CACHE_TTL = 4000; // 4 ثوانٍ لملفات m3u8 (لأن البث المباشر يتحدث باستمرار)
+const TS_CACHE_TTL = 60000; // 60 ثانية لقطع الفيديو .ts (لأنها ثابتة ولا تتغير)
+const MAX_TS_CACHE_ITEMS = 500; // الحد الأقصى لعدد قطع الفيديو في الذاكرة لحماية الرام
+
+// خرائط التخزين المؤقت والطلبات المعلقة (Request Coalescing)
+const manifestCache = new Map();     // لتخزين بيانات m3u8
+const manifestPromises = new Map();  // لتخزين الطلبات التي قيد التنفيذ حالياً لـ m3u8
+
+const tsCache = new Map();           // لتخزين بيانات قطع الفيديو (Buffers)
+const tsPromises = new Map();        // لتخزين الطلبات التي قيد التنفيذ حالياً لـ ts
+
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36';
+
 app.use(compression());
 
 app.use((req, res, next) => {
@@ -19,7 +33,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// دالة لتوليد توكن مشفر وموقع وآمن
+// دالة لتوليد توكن مشفر
 function generateShortToken(targetUrl) {
     const expiresAt = Date.now() + (TOKEN_EXPIRY_HOURS * 60 * 60 * 1000);
     const payload = JSON.stringify({ url: targetUrl, exp: expiresAt });
@@ -33,7 +47,7 @@ function generateShortToken(targetUrl) {
     return `${base64Payload}.${signature}`;
 }
 
-// دالة فحص التوكن والتحقق من الصلاحية (الساعتين)
+// دالة فحص التوكن
 function decryptShortToken(token) {
     try {
         const parts = token.split('.');
@@ -63,19 +77,122 @@ function decryptShortToken(token) {
     }
 }
 
-let manifestCache = { data: null, timestamp: 0, token: null };
-const CACHE_TTL = 4000;
-let pendingManifestPromise = null;
+// ==========================================
+// قلب النظام: مدير جلب وتخزين ملفات Manifest
+// ==========================================
+async function fetchAndRewriteManifest(targetUrl, req) {
+    // 1. هل النتيجة موجودة في الكاش وصالحة؟
+    if (manifestCache.has(targetUrl)) {
+        const cached = manifestCache.get(targetUrl);
+        if (Date.now() < cached.expireTime) return cached.data;
+    }
 
-// مسار توليد الرابط المختصر
+    // 2. هل هناك طلب يتم جلبه الآن؟ (لو 1000 شخص طلبوا معاً، 999 سينتظرون هنا)
+    if (manifestPromises.has(targetUrl)) {
+        return manifestPromises.get(targetUrl);
+    }
+
+    // 3. إنشاء طلب جديد للسيرفر الأصلي (سيتم تنفيذه مرة واحدة فقط)
+    const promise = (async () => {
+        try {
+            const response = await axios.get(targetUrl, {
+                headers: { 'User-Agent': USER_AGENT },
+                maxRedirects: 10,
+                validateStatus: status => status >= 200 && status < 500
+            });
+
+            if (typeof response.data !== 'string') throw new Error('Invalid manifest data');
+
+            const finalUrl = response.request.res.responseUrl || targetUrl;
+            const baseUrl = new URL(finalUrl).origin;
+
+            let lines = response.data.split('\n');
+            let rewrittenLines = lines.map(line => {
+                let trimmed = line.trim();
+                if (trimmed.startsWith('#') || !trimmed) return trimmed;
+
+                let absoluteLink = trimmed.startsWith('http') ? trimmed 
+                                 : trimmed.startsWith('/') ? baseUrl + trimmed 
+                                 : new URL(trimmed, finalUrl).href;
+
+                const hostProtocol = req.protocol;
+                const hostName = req.get('host');
+                return `${hostProtocol}://${hostName}/proxy?url=${encodeURIComponent(absoluteLink)}`;
+            });
+
+            const finalManifest = rewrittenLines.join('\n');
+            
+            // حفظ النتيجة في الكاش
+            manifestCache.set(targetUrl, { data: finalManifest, expireTime: Date.now() + MANIFEST_CACHE_TTL });
+            return finalManifest;
+        } finally {
+            // مسح الوعد بعد الانتهاء لكي يتم عمل طلب جديد عند انتهاء الكاش
+            manifestPromises.delete(targetUrl);
+        }
+    })();
+
+    manifestPromises.set(targetUrl, promise);
+    return promise;
+}
+
+// ==========================================
+// قلب النظام: مدير جلب وتخزين قطع الفيديو TS
+// ==========================================
+async function fetchSegment(targetUrl) {
+    if (tsCache.has(targetUrl)) {
+        const cached = tsCache.get(targetUrl);
+        if (Date.now() < cached.expireTime) return cached;
+    }
+
+    if (tsPromises.has(targetUrl)) {
+        return tsPromises.get(targetUrl);
+    }
+
+    const promise = (async () => {
+        try {
+            const response = await axios.get(targetUrl, {
+                headers: { 'User-Agent': USER_AGENT },
+                responseType: 'arraybuffer', // تحميل الملف بالكامل إلى الذاكرة
+                maxRedirects: 5,
+                validateStatus: status => status >= 200 && status < 500
+            });
+
+            const result = {
+                buffer: Buffer.from(response.data),
+                contentType: response.headers['content-type'] || 'video/MP2T'
+            };
+
+            // حماية الذاكرة (RAM): إذا زاد الكاش عن الحد، نحذف أقدم ملف
+            if (tsCache.size >= MAX_TS_CACHE_ITEMS) {
+                const oldestKey = tsCache.keys().next().value;
+                tsCache.delete(oldestKey);
+            }
+
+            tsCache.set(targetUrl, { ...result, expireTime: Date.now() + TS_CACHE_TTL });
+
+            // حذف الملف من الذاكرة تلقائياً بعد مرور الوقت
+            setTimeout(() => { tsCache.delete(targetUrl); }, TS_CACHE_TTL);
+
+            return result;
+        } finally {
+            tsPromises.delete(targetUrl);
+        }
+    })();
+
+    tsPromises.set(targetUrl, promise);
+    return promise;
+}
+
+// ==========================================
+// المسارات (Routes)
+// ==========================================
+
 app.get('/generate', (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Please provide a ?url=...');
 
     const token = generateShortToken(targetUrl);
-    const hostProtocol = req.protocol;
-    const hostName = req.get('host');
-    const shortLink = `${hostProtocol}://${hostName}/play/${token}/manifest.m3u8`;
+    const shortLink = `${req.protocol}://${req.get('host')}/play/${token}/manifest.m3u8`;
 
     res.send(`
         <html dir="rtl" style="background:#0f172a;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;">
@@ -86,174 +203,47 @@ app.get('/generate', (req, res) => {
     `);
 });
 
-// مسار المشغل والمانفيست
+// مسار المشغل والمانفيست (بالتوكن)
 app.get('/play/:token/manifest.m3u8', async (req, res) => {
     const { token } = req.params;
     const decrypted = decryptShortToken(token);
 
-    if (decrypted.error === 'Expired') {
-        return res.status(403).send('انتهت صلاحية هذا الرابط (عبر ساعتين).');
-    }
-    if (decrypted.error === 'Invalid' || !decrypted.targetUrl) {
-        return res.status(400).send('رابط غير صالح.');
-    }
-
-    const targetUrl = decrypted.targetUrl;
-    const now = Date.now();
-
-    if (manifestCache.data && manifestCache.token === token && (now - manifestCache.timestamp < CACHE_TTL)) {
-        res.set('Content-Type', 'application/vnd.apple.mpegurl');
-        return res.send(manifestCache.data);
-    }
-
-    if (pendingManifestPromise) {
-        try {
-            const cachedData = await pendingManifestPromise;
-            res.set('Content-Type', 'application/vnd.apple.mpegurl');
-            return res.send(cachedData);
-        } catch (e) {
-            return res.status(500).send('Error in pending request');
-        }
-    }
-
-    pendingManifestPromise = (async () => {
-        try {
-            const config = {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
-                    'Range': 'bytes=0-'
-                },
-                validateStatus: status => status >= 200 && status < 500
-            };
-
-            const response = await axios.get(targetUrl, config);
-            const finalUrl = response.request.res.responseUrl || targetUrl;
-            const baseUrl = new URL(finalUrl).origin;
-
-            let lines = response.data.split('\n');
-            let rewrittenLines = lines.map(line => {
-                let trimmed = line.trim();
-                if (trimmed.startsWith('#') || !trimmed) return trimmed;
-
-                let absoluteLink = '';
-                if (trimmed.startsWith('http')) {
-                    absoluteLink = trimmed;
-                } else if (trimmed.startsWith('/')) {
-                    absoluteLink = baseUrl + trimmed;
-                } else {
-                    absoluteLink = new URL(trimmed, finalUrl).href;
-                }
-
-                const hostProtocol = req.protocol;
-                const hostName = req.get('host');
-                return `${hostProtocol}://${hostName}/proxy?url=${encodeURIComponent(absoluteLink)}`;
-            });
-
-            const finalManifest = rewrittenLines.join('\n');
-
-            manifestCache = {
-                data: finalManifest,
-                timestamp: Date.now(),
-                token: token
-            };
-
-            return finalManifest;
-        } finally {
-            pendingManifestPromise = null;
-        }
-    })();
+    if (decrypted.error === 'Expired') return res.status(403).send('انتهت صلاحية هذا الرابط (عبر ساعتين).');
+    if (decrypted.error === 'Invalid' || !decrypted.targetUrl) return res.status(400).send('رابط غير صالح.');
 
     try {
-        const result = await pendingManifestPromise;
+        const manifest = await fetchAndRewriteManifest(decrypted.targetUrl, req);
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
-        res.send(result);
+        res.send(manifest);
     } catch (error) {
-        if (manifestCache.data) {
-            res.set('Content-Type', 'application/vnd.apple.mpegurl');
-            return res.send(manifestCache.data);
-        }
         res.status(500).send('Error fetching manifest');
     }
 });
 
 // مسار مباشر ودائم بدون توكن
-// مسار مباشر ودائم يدعم الروابط المحولة (Redirects)
 app.get('/direct/manifest.m3u8', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Please provide a ?url=...');
 
     try {
-        const config = {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
-                'Accept': '*/*',
-                'Connection': 'keep-alive',
-                'Range': 'bytes=0-'
-            },
-            maxRedirects: 10, // السماح باتباع حتى 10 عمليات تحويل تلقائياً
-            validateStatus: status => status >= 200 && status < 500
-        };
-
-        // استخدام axios لجلب الرابط مع تتبع التحويلات
-        const response = await axios.get(targetUrl, config);
-        
-        // استخراج الرابط النهائي الفعلي بعد كل عمليات التحويل
-        const finalUrl = response.request.res.responseUrl || targetUrl;
-        const baseUrl = new URL(finalUrl).origin;
-
-        // التأكد من أن الاستجابة هي نص وليست بيانات ثنائية
-        if (typeof response.data !== 'string') {
-            return res.status(500).send('Invalid manifest response format after redirect.');
-        }
-
-        let lines = response.data.split('\n');
-        let rewrittenLines = lines.map(line => {
-            let trimmed = line.trim();
-            if (trimmed.startsWith('#') || !trimmed) return trimmed;
-
-            let absoluteLink = '';
-            if (trimmed.startsWith('http')) {
-                absoluteLink = trimmed;
-            } else if (trimmed.startsWith('/')) {
-                absoluteLink = baseUrl + trimmed;
-            } else {
-                absoluteLink = new URL(trimmed, finalUrl).href;
-            }
-
-            const hostProtocol = req.protocol;
-            const hostName = req.get('host');
-            return `${hostProtocol}://${hostName}/proxy?url=${encodeURIComponent(absoluteLink)}`;
-        });
-
+        const manifest = await fetchAndRewriteManifest(targetUrl, req);
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
-        res.send(rewrittenLines.join('\n'));
+        res.send(manifest);
     } catch (error) {
-        console.error('Redirect Manifest Error:', error.message);
-        res.status(500).send('Error fetching and following redirect for manifest');
+        res.status(500).send('Error fetching direct manifest');
     }
 });
 
-// مسار البروكسي لقطع الفيديو .ts
+// مسار البروكسي لقطع الفيديو .ts (مع الكاش!)
 app.get('/proxy', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('No URL provided');
 
     try {
-        const response = await axios.get(targetUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
-                'Range': 'bytes=0-'
-            },
-            responseType: 'stream',
-            validateStatus: status => status >= 200 && status < 500
-        });
-
-        res.set('Access-Control-Allow-Origin', '*');
-        res.set('Content-Type', response.headers['content-type'] || 'video/MP2T');
-        if (response.headers['content-range']) {
-            res.set('Content-Range', response.headers['content-range']);
-        }
-        response.data.pipe(res);
+        const segment = await fetchSegment(targetUrl);
+        res.set('Content-Type', segment.contentType);
+        // نرسل البيانات مباشرة من الذاكرة
+        res.send(segment.buffer);
     } catch (error) {
         res.status(500).send('Proxy Error');
     }

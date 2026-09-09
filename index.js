@@ -12,23 +12,22 @@ const SECRET_KEY = process.env.SECRET_KEY || 'my-super-secret-streaming-key-2026
 const TOKEN_EXPIRY_HOURS = 2;
 
 // ==========================================
-// 1. نظام الحماية الذكي للاتصالات (Single Socket)
+// 1. نظام الاتصالات
 // ==========================================
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 1, keepAliveMsecs: 10000 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 1, keepAliveMsecs: 10000 });
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 10, keepAliveMsecs: 10000 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 10, keepAliveMsecs: 10000 });
 
-// إخفاء هوية السيرفر وانتحال شخصية مشغل IPTV (VLC) لتجاوز حظر السيرفرات
 const IPTV_USER_AGENT = 'VLC/3.0.18 LibVLC/3.0.18';
 
 const axiosInstance = axios.create({
     httpAgent,
     httpsAgent,
-    timeout: 8000,
-    maxRedirects: 10, // مهم جداً للسماح بتحويل orien.live إلى الـ IP
+    timeout: 10000,
+    maxRedirects: 10,
 });
 
 // ==========================================
-// 2. كلاس الكاش الذكي
+// 2. الكاش الذكي
 // ==========================================
 class SmartCache {
     constructor(maxItems = 300, defaultTtlMs = 60000) {
@@ -63,10 +62,6 @@ class SmartCache {
         }
         this.cache.set(key, { data, expiresAt: Date.now() + ttlMs });
     }
-
-    delete(key) {
-        this.cache.delete(key);
-    }
 }
 
 const manifestCache = new SmartCache(50, 3000); 
@@ -91,7 +86,7 @@ function setCooldown(url, durationMs = 4000) {
 }
 
 // ==========================================
-// 3. دوال مساعدة (توليد الهيدرز والتوكن)
+// 3. دوال مساعدة استخراج الرابط الكامل والدقيقة
 // ==========================================
 app.use(compression());
 
@@ -103,7 +98,21 @@ app.use((req, res, next) => {
     next();
 });
 
-// استخراج الترويسات التي تتخطى الحماية (Referer و Host)
+// استخراج الرابط الكامل بدون أن يقطعه Express عند وجود توكن ?token=...
+function extractTargetUrl(req) {
+    const rawUrlIndex = req.originalUrl.indexOf('url=');
+    if (rawUrlIndex !== -1) {
+        let rawUrl = req.originalUrl.substring(rawUrlIndex + 4);
+        try {
+            return decodeURIComponent(rawUrl);
+        } catch (e) {
+            return rawUrl;
+        }
+    }
+    return req.query.url || null;
+}
+
+// بناء الترويسات بدون تثبيت Host لتسهيل التحويلات
 function getHeadersForUrl(targetUrl) {
     try {
         const parsedUrl = new URL(targetUrl);
@@ -111,8 +120,7 @@ function getHeadersForUrl(targetUrl) {
             'User-Agent': IPTV_USER_AGENT,
             'Accept': '*/*',
             'Referer': `${parsedUrl.origin}/`,
-            'Origin': parsedUrl.origin,
-            'Host': parsedUrl.host
+            'Origin': parsedUrl.origin
         };
     } catch (e) {
         return { 'User-Agent': IPTV_USER_AGENT };
@@ -146,7 +154,7 @@ function decryptShortToken(token) {
 }
 
 // ==========================================
-// 4. جلب المانفيست (مع تمرير التوكن الذكي)
+// 4. معالجة وتعديل المانفيست
 // ==========================================
 async function fetchAndRewriteManifest(targetUrl, req) {
     const cachedData = manifestCache.get(targetUrl);
@@ -174,29 +182,33 @@ async function fetchAndRewriteManifest(targetUrl, req) {
                 throw new Error(`Origin error HTTP ${response.status}`);
             }
 
-            // استخراج الرابط النهائي بعد التحويل (مهم جداً لأن orien.live يحول إلى IP مع توكن)
             const finalUrl = response.request.res.responseUrl || targetUrl;
             const parsedFinalUrl = new URL(finalUrl);
             const baseUrl = parsedFinalUrl.origin;
-            const finalSearchParams = parsedFinalUrl.search; // استخراج التوكن المخفي: "?token=..."
+            const finalSearchParams = parsedFinalUrl.search;
 
             let lines = response.data.split('\n');
             let rewrittenLines = lines.map(line => {
                 let trimmed = line.trim();
                 if (trimmed.startsWith('#') || !trimmed) return trimmed;
 
-                // بناء الرابط المطلق لقطعة الـ TS
                 let absoluteLink = trimmed.startsWith('http') ? trimmed 
                                  : trimmed.startsWith('/') ? baseUrl + trimmed 
                                  : new URL(trimmed, finalUrl).href;
 
-                // السحر هنا: إذا كان الرابط النهائي يحتوي على توكن، نلصقه بقطع الفيديو لتجنب حظرها!
                 if (finalSearchParams && !absoluteLink.includes('?')) {
                     absoluteLink += finalSearchParams;
                 }
 
                 const hostProtocol = req.protocol;
                 const hostName = req.get('host');
+
+                // التعديل الجوهري: إذا كان السطر يشير إلى ملف m3u8 آخر (Master Playlist)، نوجهه إلى البروكسي الخاص بالمانفيست
+                if (absoluteLink.includes('.m3u8')) {
+                    return `${hostProtocol}://${hostName}/direct/manifest.m3u8?url=${encodeURIComponent(absoluteLink)}`;
+                }
+
+                // إذا كان قطعة فيديو TS أو AAC نوجهه لبروكـسي القطع
                 return `${hostProtocol}://${hostName}/proxy?url=${encodeURIComponent(absoluteLink)}`;
             });
 
@@ -219,7 +231,7 @@ async function fetchAndRewriteManifest(targetUrl, req) {
 }
 
 // ==========================================
-// 5. جلب قطع الفيديو .TS
+// 5. جلب القطع TS
 // ==========================================
 async function fetchSegment(targetUrl) {
     const cachedSegment = tsCache.get(targetUrl);
@@ -268,7 +280,7 @@ async function fetchSegment(targetUrl) {
 // ==========================================
 
 app.get('/generate', (req, res) => {
-    const targetUrl = req.query.url;
+    const targetUrl = extractTargetUrl(req);
     if (!targetUrl) return res.status(400).send('Please provide a ?url=...');
 
     const token = generateShortToken(targetUrl);
@@ -299,7 +311,7 @@ app.get('/play/:token/manifest.m3u8', async (req, res) => {
 });
 
 app.get('/direct/manifest.m3u8', async (req, res) => {
-    const targetUrl = req.query.url;
+    const targetUrl = extractTargetUrl(req);
     if (!targetUrl) return res.status(400).send('Please provide a ?url=...');
 
     try {
@@ -312,7 +324,7 @@ app.get('/direct/manifest.m3u8', async (req, res) => {
 });
 
 app.get('/proxy', async (req, res) => {
-    const targetUrl = req.query.url;
+    const targetUrl = extractTargetUrl(req);
     if (!targetUrl) return res.status(400).send('No URL provided');
 
     try {

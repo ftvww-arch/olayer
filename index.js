@@ -7,7 +7,7 @@ const https = require('https');
 
 const app = express();
 
-// تفعيل trust proxy ليقرأ Express بروتوكول HTTPS بشكل صحيح على Railway
+// تفعيل trust proxy ليتم إدراك بروتوكولات Railway و Cloudflare بشكل صحيح
 app.set('trust proxy', true);
 
 const PORT = process.env.PORT || 3000;
@@ -15,11 +15,12 @@ const SECRET_KEY = process.env.SECRET_KEY || 'my-super-secret-streaming-key-2026
 const TOKEN_EXPIRY_HOURS = 2;
 
 // ==========================================
-// 1. نظام الاتصالات
+// 1. نظام الاتصالات والتحكم بالـ Sockets
 // ==========================================
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 20, keepAliveMsecs: 10000 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 20, keepAliveMsecs: 10000 });
 
+// User-Agent افتراضي مطابق للـ Chrome المذكور بالسيرفر الأول
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
 
 const axiosInstance = axios.create({
@@ -65,6 +66,10 @@ class SmartCache {
         }
         this.cache.set(key, { data, expiresAt: Date.now() + ttlMs });
     }
+
+    delete(key) {
+        this.cache.delete(key);
+    }
 }
 
 const manifestCache = new SmartCache(50, 3000); 
@@ -89,16 +94,18 @@ function setCooldown(url, durationMs = 4000) {
 }
 
 // ==========================================
-// 3. الميدل وير وتسهيل مسارات الـ URLs
+// 3. الميدل وير ودوال استخراج البيانات وتمرير الهيدرز
 // ==========================================
 
+// استثناء البروكسي من ضغط gZip لحماية قطع TS من التلف في مشغلات الويب
 app.use(compression({
     filter: (req, res) => {
-        if (req.path.startsWith('/segment')) return false;
+        if (req.path.startsWith('/proxy')) return false;
         return compression.filter(req, res);
     }
 }));
 
+// إعدادات CORS المتقدمة لتوافق جميع مشغلات الويب
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -108,7 +115,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// استخراج الرابط بالكامل
+// استخراج الرابط بالكامل دون قطعه عند وجود علامات استفهام وتوكينات إضافية
 function extractTargetUrl(req) {
     const rawUrlIndex = req.originalUrl.indexOf('url=');
     if (rawUrlIndex !== -1) {
@@ -122,39 +129,67 @@ function extractTargetUrl(req) {
     return req.query.url || null;
 }
 
+// بناء وتمرير الترويسات ديناميكياً للسيرفر الأصلي
 function getHeadersForUrl(targetUrl, req = null) {
     try {
         const parsedUrl = new URL(targetUrl);
+        
         const userAgent = (req && req.headers['user-agent'] && !req.headers['user-agent'].includes('node-fetch'))
             ? req.headers['user-agent']
             : DEFAULT_USER_AGENT;
 
-        return {
+        const referer = (req && req.headers['referer'])
+            ? req.headers['referer']
+            : `${parsedUrl.origin}/`;
+
+        const headers = {
             'User-Agent': userAgent,
             'Accept': '*/*',
-            'Referer': `${parsedUrl.origin}/`,
+            'Referer': referer,
             'Origin': parsedUrl.origin
         };
+
+        if (req && req.query && req.query.headers) {
+            try {
+                const customHeaders = JSON.parse(decodeURIComponent(req.query.headers));
+                Object.assign(headers, customHeaders);
+            } catch (e) {}
+        }
+
+        return headers;
     } catch (e) {
         return { 'User-Agent': DEFAULT_USER_AGENT };
     }
 }
 
-// ترميز وفك تشفير مسارات قطع الفيديو لجعلها نظيفة مثل السيرفرات الأخرى
-function encodeSegmentUrl(url) {
-    return Buffer.from(url).toString('base64url');
+function generateShortToken(targetUrl) {
+    const expiresAt = Date.now() + (TOKEN_EXPIRY_HOURS * 60 * 60 * 1000);
+    const payload = JSON.stringify({ url: targetUrl, exp: expiresAt });
+    const base64Payload = Buffer.from(payload).toString('base64url');
+    const signature = crypto.createHmac('sha256', SECRET_KEY).update(base64Payload).digest('hex');
+    return `${base64Payload}.${signature}`;
 }
 
-function decodeSegmentUrl(encoded) {
+function decryptShortToken(token) {
     try {
-        return Buffer.from(encoded, 'base64url').toString('utf8');
+        const parts = token.split('.');
+        if (parts.length !== 2) return { error: 'Invalid' };
+        const [base64Payload, signature] = parts;
+        const expectedSignature = crypto.createHmac('sha256', SECRET_KEY).update(base64Payload).digest('hex');
+        if (signature !== expectedSignature) return { error: 'Invalid' };
+        
+        const payloadJson = Buffer.from(base64Payload, 'base64url').toString('utf8');
+        const { url, exp } = JSON.parse(payloadJson);
+        if (Date.now() > exp) return { error: 'Expired' };
+        
+        return { targetUrl: url };
     } catch (e) {
-        return null;
+        return { error: 'Invalid' };
     }
 }
 
 // ==========================================
-// 4. جلب وترجمة المانفيست
+// 4. جلب المانفيست وتعديل الروابط
 // ==========================================
 async function fetchAndRewriteManifest(targetUrl, req) {
     const cachedData = manifestCache.get(targetUrl);
@@ -187,13 +222,14 @@ async function fetchAndRewriteManifest(targetUrl, req) {
             const baseUrl = parsedFinalUrl.origin;
             const finalSearchParams = parsedFinalUrl.search;
 
-            // تحديد البروتوكول الصحيح (إجبار https على Railway)
-            const hostProtocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+            // إجبار بروتوكول https دائماً لمنع حظر Mixed Content في المتصفحات
             const hostName = req.get('host');
+            const proxyBase = `https://${hostName}`;
 
             let lines = response.data.split('\n');
             let rewrittenLines = lines.map(line => {
-                let trimmed = line.trim();
+                // تنظيف السطر من \r والرموز الشاذة (\) في النهاية
+                let trimmed = line.trim().replace(/\r/g, '').replace(/\\$/g, '');
                 if (trimmed.startsWith('#') || !trimmed) return trimmed;
 
                 let absoluteLink = trimmed.startsWith('http') ? trimmed 
@@ -204,14 +240,11 @@ async function fetchAndRewriteManifest(targetUrl, req) {
                     absoluteLink += finalSearchParams;
                 }
 
-                // إذا كان ملف m3u8 فرعي
                 if (absoluteLink.includes('.m3u8')) {
-                    return `${hostProtocol}://${hostName}/direct/manifest.m3u8?url=${encodeURIComponent(absoluteLink)}`;
+                    return `${proxyBase}/direct/manifest.m3u8?url=${encodeURIComponent(absoluteLink)}`;
                 }
 
-                // تحويل قطعة TS إلى رابط نظيف ومشفر بالكامل
-                const encodedPath = encodeSegmentUrl(absoluteLink);
-                return `${hostProtocol}://${hostName}/segment/${encodedPath}/video.ts`;
+                return `${proxyBase}/proxy?url=${encodeURIComponent(absoluteLink)}`;
             });
 
             const finalManifest = rewrittenLines.join('\n');
@@ -233,11 +266,11 @@ async function fetchAndRewriteManifest(targetUrl, req) {
 }
 
 // ==========================================
-// 5. جلب قطع الفيديو بمسار نظيف (/segment/:b64/video.ts)
+// 5. مسار جلب قطع الفيديو TS مع دعم Range
 // ==========================================
-app.get('/segment/:encodedUrl/video.ts', async (req, res) => {
-    const targetUrl = decodeSegmentUrl(req.params.encodedUrl);
-    if (!targetUrl) return res.status(400).send('Invalid segment path');
+app.get('/proxy', async (req, res) => {
+    const targetUrl = extractTargetUrl(req);
+    if (!targetUrl) return res.status(400).send('No URL provided');
 
     try {
         const headers = getHeadersForUrl(targetUrl, req);
@@ -266,13 +299,44 @@ app.get('/segment/:encodedUrl/video.ts', async (req, res) => {
         res.status(response.status).send(Buffer.from(response.data));
 
     } catch (error) {
-        res.status(500).send('Segment Proxy Error');
+        res.status(500).send('Proxy Segment Error');
     }
 });
 
 // ==========================================
 // 6. المسارات الرئيسية
 // ==========================================
+
+app.get('/generate', (req, res) => {
+    const targetUrl = extractTargetUrl(req);
+    if (!targetUrl) return res.status(400).send('Please provide a ?url=...');
+
+    const token = generateShortToken(targetUrl);
+    const shortLink = `https://${req.get('host')}/play/${token}/manifest.m3u8`;
+
+    res.send(`
+        <html dir="rtl" style="background:#0f172a;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;">
+            <h3>رابط البث المشفر:</h3>
+            <input type="text" readonly value="${shortLink}" style="width:80%;max-width:600px;padding:10px;background:#1e293b;border:1px solid #475569;color:#38bdf8;border-radius:6px;" onclick="this.select();">
+        </html>
+    `);
+});
+
+app.get('/play/:token/manifest.m3u8', async (req, res) => {
+    const { token } = req.params;
+    const decrypted = decryptShortToken(token);
+
+    if (decrypted.error === 'Expired') return res.status(403).send('انتهت الصلاحية.');
+    if (decrypted.error === 'Invalid' || !decrypted.targetUrl) return res.status(400).send('رابط غير صالح.');
+
+    try {
+        const manifest = await fetchAndRewriteManifest(decrypted.targetUrl, req);
+        res.set('Content-Type', 'application/vnd.apple.mpegurl');
+        res.send(manifest);
+    } catch (error) {
+        res.status(500).send('Stream error');
+    }
+});
 
 app.get('/direct/manifest.m3u8', async (req, res) => {
     const targetUrl = extractTargetUrl(req);
@@ -285,6 +349,44 @@ app.get('/direct/manifest.m3u8', async (req, res) => {
     } catch (error) {
         res.status(500).send('Direct fetch error');
     }
+});
+
+app.get('/watch', (req, res) => {
+    const targetUrl = extractTargetUrl(req);
+    if (!targetUrl) return res.status(400).send('Please provide a ?url=...');
+
+    const proxyUrl = `/direct/manifest.m3u8?url=${encodeURIComponent(targetUrl)}`;
+
+    res.send(`
+        <!DOCTYPE html>
+        <html lang="ar" dir="rtl">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>مشغل البث المباشر</title>
+            <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+            <style>
+                body { margin: 0; background: #000; display: flex; justify-content: center; align-items: center; height: 100vh; }
+                video { width: 100%; max-width: 960px; height: auto; }
+            </style>
+        </head>
+        <body>
+            <video id="video" controls autoplay playsinline></video>
+            <script>
+                const video = document.getElementById('video');
+                const streamUrl = "${proxyUrl}";
+
+                if (Hls.isSupported()) {
+                    const hls = new Hls({ enableWorker: true });
+                    hls.loadSource(streamUrl);
+                    hls.attachMedia(video);
+                } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                    video.src = streamUrl;
+                }
+            </script>
+        </body>
+        </html>
+    `);
 });
 
 app.listen(PORT, () => {

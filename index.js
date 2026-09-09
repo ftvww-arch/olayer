@@ -12,10 +12,10 @@ const SECRET_KEY = process.env.SECRET_KEY || 'my-super-secret-streaming-key-2026
 const TOKEN_EXPIRY_HOURS = 2;
 
 // ==========================================
-// 1. نظام الاتصالات
+// 1. نظام الاتصالات (معدل لاستيعاب الاتصالات المتعددة)
 // ==========================================
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 10, keepAliveMsecs: 10000 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 10, keepAliveMsecs: 10000 });
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 15, keepAliveMsecs: 10000 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 15, keepAliveMsecs: 10000 });
 
 const IPTV_USER_AGENT = 'VLC/3.0.18 LibVLC/3.0.18';
 
@@ -62,6 +62,10 @@ class SmartCache {
         }
         this.cache.set(key, { data, expiresAt: Date.now() + ttlMs });
     }
+
+    delete(key) {
+        this.cache.delete(key);
+    }
 }
 
 const manifestCache = new SmartCache(50, 3000); 
@@ -86,19 +90,28 @@ function setCooldown(url, durationMs = 4000) {
 }
 
 // ==========================================
-// 3. دوال مساعدة استخراج الرابط الكامل والدقيقة
+// 3. الميدل وير ودوال استخراج الرابط والهيدرز
 // ==========================================
-app.use(compression());
 
+// استثناء قطع الفيديو من الضغط لتفادي تلفها في مشغلات الويب
+app.use(compression({
+    filter: (req, res) => {
+        if (req.path.startsWith('/proxy')) return false;
+        return compression.filter(req, res);
+    }
+}));
+
+// إعدادات CORS المتقدمة للمتصفحات
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range');
+    res.header('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
     if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
 
-// استخراج الرابط الكامل بدون أن يقطعه Express عند وجود توكن ?token=...
+// استخراج الرابط كاملاً مهما احتوى على علامات استفهام وتوكينات فرعية
 function extractTargetUrl(req) {
     const rawUrlIndex = req.originalUrl.indexOf('url=');
     if (rawUrlIndex !== -1) {
@@ -112,7 +125,7 @@ function extractTargetUrl(req) {
     return req.query.url || null;
 }
 
-// بناء الترويسات بدون تثبيت Host لتسهيل التحويلات
+// بناء الهيدرز بدون تثبيت Host لتسهيل الـ Redirect المباشر
 function getHeadersForUrl(targetUrl) {
     try {
         const parsedUrl = new URL(targetUrl);
@@ -154,7 +167,7 @@ function decryptShortToken(token) {
 }
 
 // ==========================================
-// 4. معالجة وتعديل المانفيست
+// 4. جلب وترجمة المانفيست
 // ==========================================
 async function fetchAndRewriteManifest(targetUrl, req) {
     const cachedData = manifestCache.get(targetUrl);
@@ -203,12 +216,12 @@ async function fetchAndRewriteManifest(targetUrl, req) {
                 const hostProtocol = req.protocol;
                 const hostName = req.get('host');
 
-                // التعديل الجوهري: إذا كان السطر يشير إلى ملف m3u8 آخر (Master Playlist)، نوجهه إلى البروكسي الخاص بالمانفيست
+                // إذا كان السطر ملف m3u8 فرعي، نوجهه للمانفيست المباشر
                 if (absoluteLink.includes('.m3u8')) {
                     return `${hostProtocol}://${hostName}/direct/manifest.m3u8?url=${encodeURIComponent(absoluteLink)}`;
                 }
 
-                // إذا كان قطعة فيديو TS أو AAC نوجهه لبروكـسي القطع
+                // توجيه قطع الفيديو للبروكـسي
                 return `${hostProtocol}://${hostName}/proxy?url=${encodeURIComponent(absoluteLink)}`;
             });
 
@@ -231,52 +244,45 @@ async function fetchAndRewriteManifest(targetUrl, req) {
 }
 
 // ==========================================
-// 5. جلب القطع TS
+// 5. مسار جلب قطع الفيديو TS
 // ==========================================
-async function fetchSegment(targetUrl) {
-    const cachedSegment = tsCache.get(targetUrl);
-    if (cachedSegment) return cachedSegment;
+app.get('/proxy', async (req, res) => {
+    const targetUrl = extractTargetUrl(req);
+    if (!targetUrl) return res.status(400).send('No URL provided');
 
-    if (tsPromises.has(targetUrl)) return tsPromises.get(targetUrl);
-
-    if (isCoolingDown(targetUrl)) {
-        const stale = tsCache.getStale(targetUrl);
-        if (stale) return stale;
-        throw new Error('Origin segment on cooldown');
-    }
-
-    const promise = (async () => {
-        try {
-            const response = await axiosInstance.get(targetUrl, {
-                headers: getHeadersForUrl(targetUrl),
-                responseType: 'arraybuffer',
-                validateStatus: status => status >= 200 && status < 300
-            });
-
-            const result = {
-                buffer: Buffer.from(response.data),
-                contentType: response.headers['content-type'] || 'video/MP2T'
-            };
-
-            tsCache.set(targetUrl, result, 45000);
-            return result;
-
-        } catch (error) {
-            setCooldown(targetUrl, 3000);
-            const stale = tsCache.getStale(targetUrl);
-            if (stale) return stale;
-            throw error;
-        } finally {
-            tsPromises.delete(targetUrl);
+    try {
+        const headers = getHeadersForUrl(targetUrl);
+        
+        if (req.headers.range) {
+            headers['Range'] = req.headers.range;
         }
-    })();
 
-    tsPromises.set(targetUrl, promise);
-    return promise;
-}
+        const response = await axiosInstance.get(targetUrl, {
+            headers,
+            responseType: 'arraybuffer',
+            validateStatus: status => status >= 200 && status < 500
+        });
+
+        res.set({
+            'Content-Type': response.headers['content-type'] || 'video/mp2t',
+            'Accept-Ranges': 'bytes',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges'
+        });
+
+        if (response.headers['content-range']) {
+            res.set('Content-Range', response.headers['content-range']);
+        }
+
+        res.status(response.status).send(Buffer.from(response.data));
+
+    } catch (error) {
+        res.status(500).send('Proxy Segment Error');
+    }
+});
 
 // ==========================================
-// 6. المسارات
+// 6. المسارات الرئيسية
 // ==========================================
 
 app.get('/generate', (req, res) => {
@@ -323,17 +329,43 @@ app.get('/direct/manifest.m3u8', async (req, res) => {
     }
 });
 
-app.get('/proxy', async (req, res) => {
+// مسار مشاهدة مدمج لفتح واختبار البث فوراً عبر المتصفح
+app.get('/watch', (req, res) => {
     const targetUrl = extractTargetUrl(req);
-    if (!targetUrl) return res.status(400).send('No URL provided');
+    if (!targetUrl) return res.status(400).send('Please provide a ?url=...');
 
-    try {
-        const segment = await fetchSegment(targetUrl);
-        res.set('Content-Type', segment.contentType);
-        res.send(segment.buffer);
-    } catch (error) {
-        res.status(500).send('Proxy Segment Error');
-    }
+    const proxyUrl = `/direct/manifest.m3u8?url=${encodeURIComponent(targetUrl)}`;
+
+    res.send(`
+        <!DOCTYPE html>
+        <html lang="ar" dir="rtl">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>مشغل البث المباشر</title>
+            <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+            <style>
+                body { margin: 0; background: #000; display: flex; justify-content: center; align-items: center; height: 100vh; }
+                video { width: 100%; max-width: 960px; height: auto; }
+            </style>
+        </head>
+        <body>
+            <video id="video" controls autoplay playsinline></video>
+            <script>
+                const video = document.getElementById('video');
+                const streamUrl = "${proxyUrl}";
+
+                if (Hls.isSupported()) {
+                    const hls = new Hls({ enableWorker: true });
+                    hls.loadSource(streamUrl);
+                    hls.attachMedia(video);
+                } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                    video.src = streamUrl;
+                }
+            </script>
+        </body>
+        </html>
+    `);
 });
 
 app.listen(PORT, () => {

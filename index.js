@@ -12,12 +12,13 @@ const SECRET_KEY = process.env.SECRET_KEY || 'my-super-secret-streaming-key-2026
 const TOKEN_EXPIRY_HOURS = 2;
 
 // ==========================================
-// 1. نظام الاتصالات (معدل لاستيعاب الاتصالات المتعددة)
+// 1. نظام الاتصالات المطور
 // ==========================================
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 15, keepAliveMsecs: 10000 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 15, keepAliveMsecs: 10000 });
 
-const IPTV_USER_AGENT = 'VLC/3.0.18 LibVLC/3.0.18';
+// الهيدر الافتراضي المأخوذ من بيانات السيرفر الأول لتجاوز الحظر
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
 
 const axiosInstance = axios.create({
     httpAgent,
@@ -27,7 +28,7 @@ const axiosInstance = axios.create({
 });
 
 // ==========================================
-// 2. الكاش الذكي
+// 2. كلاس الكاش الذكي
 // ==========================================
 class SmartCache {
     constructor(maxItems = 300, defaultTtlMs = 60000) {
@@ -90,10 +91,10 @@ function setCooldown(url, durationMs = 4000) {
 }
 
 // ==========================================
-// 3. الميدل وير ودوال استخراج الرابط والهيدرز
+// 3. الميدل وير ودوال حقن الهيدرز الذكية
 // ==========================================
 
-// استثناء قطع الفيديو من الضغط لتفادي تلفها في مشغلات الويب
+// استثناء قطع الفيديو من ضغط gzip لحمايتها من التلف في مشغلات الويب
 app.use(compression({
     filter: (req, res) => {
         if (req.path.startsWith('/proxy')) return false;
@@ -101,7 +102,7 @@ app.use(compression({
     }
 }));
 
-// إعدادات CORS المتقدمة للمتصفحات
+// إعدادات CORS المتقدمة
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -111,7 +112,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// استخراج الرابط كاملاً مهما احتوى على علامات استفهام وتوكينات فرعية
+// استخراج الرابط الكامل كاملاً بدون قطع التوكن
 function extractTargetUrl(req) {
     const rawUrlIndex = req.originalUrl.indexOf('url=');
     if (rawUrlIndex !== -1) {
@@ -125,18 +126,38 @@ function extractTargetUrl(req) {
     return req.query.url || null;
 }
 
-// بناء الهيدرز بدون تثبيت Host لتسهيل الـ Redirect المباشر
-function getHeadersForUrl(targetUrl) {
+// بناء وحقن الترويسات الهامة للسيرفر الأصلي
+function getHeadersForUrl(targetUrl, req = null) {
     try {
         const parsedUrl = new URL(targetUrl);
-        return {
-            'User-Agent': IPTV_USER_AGENT,
+        
+        // جلب User-Agent من الطلب أو استخدام User-Agent الخاص بـ Chrome تلقائياً
+        const userAgent = (req && req.headers['user-agent'] && !req.headers['user-agent'].includes('node-fetch'))
+            ? req.headers['user-agent']
+            : DEFAULT_USER_AGENT;
+
+        const referer = (req && req.headers['referer'])
+            ? req.headers['referer']
+            : `${parsedUrl.origin}/`;
+
+        const headers = {
+            'User-Agent': userAgent,
             'Accept': '*/*',
-            'Referer': `${parsedUrl.origin}/`,
+            'Referer': referer,
             'Origin': parsedUrl.origin
         };
+
+        // دعم حقن هيدرز مخصصة قادمة عبر Query Parameter إذا توفرت (?headers={...})
+        if (req && req.query && req.query.headers) {
+            try {
+                const customHeaders = JSON.parse(decodeURIComponent(req.query.headers));
+                Object.assign(headers, customHeaders);
+            } catch (e) {}
+        }
+
+        return headers;
     } catch (e) {
-        return { 'User-Agent': IPTV_USER_AGENT };
+        return { 'User-Agent': DEFAULT_USER_AGENT };
     }
 }
 
@@ -184,7 +205,7 @@ async function fetchAndRewriteManifest(targetUrl, req) {
     const promise = (async () => {
         try {
             const response = await axiosInstance.get(targetUrl, {
-                headers: getHeadersForUrl(targetUrl),
+                headers: getHeadersForUrl(targetUrl, req),
                 validateStatus: status => status >= 200 && status < 500
             });
 
@@ -216,12 +237,12 @@ async function fetchAndRewriteManifest(targetUrl, req) {
                 const hostProtocol = req.protocol;
                 const hostName = req.get('host');
 
-                // إذا كان السطر ملف m3u8 فرعي، نوجهه للمانفيست المباشر
+                // إذا كان ملف m3u8 فرعي يتم توجيهه لنقطة نهاية المانفيست
                 if (absoluteLink.includes('.m3u8')) {
                     return `${hostProtocol}://${hostName}/direct/manifest.m3u8?url=${encodeURIComponent(absoluteLink)}`;
                 }
 
-                // توجيه قطع الفيديو للبروكـسي
+                // توجيه القطع للبروكسي
                 return `${hostProtocol}://${hostName}/proxy?url=${encodeURIComponent(absoluteLink)}`;
             });
 
@@ -244,14 +265,14 @@ async function fetchAndRewriteManifest(targetUrl, req) {
 }
 
 // ==========================================
-// 5. مسار جلب قطع الفيديو TS
+// 5. جلب قطع الفيديو مع دعم Range والمحقونة بالهيدرز
 // ==========================================
 app.get('/proxy', async (req, res) => {
     const targetUrl = extractTargetUrl(req);
     if (!targetUrl) return res.status(400).send('No URL provided');
 
     try {
-        const headers = getHeadersForUrl(targetUrl);
+        const headers = getHeadersForUrl(targetUrl, req);
         
         if (req.headers.range) {
             headers['Range'] = req.headers.range;
@@ -329,7 +350,6 @@ app.get('/direct/manifest.m3u8', async (req, res) => {
     }
 });
 
-// مسار مشاهدة مدمج لفتح واختبار البث فوراً عبر المتصفح
 app.get('/watch', (req, res) => {
     const targetUrl = extractTargetUrl(req);
     if (!targetUrl) return res.status(400).send('Please provide a ?url=...');

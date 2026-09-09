@@ -6,18 +6,20 @@ const http = require('http');
 const https = require('https');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
+// تفعيل trust proxy ليقرأ Express بروتوكول HTTPS بشكل صحيح على Railway
+app.set('trust proxy', true);
+
+const PORT = process.env.PORT || 3000;
 const SECRET_KEY = process.env.SECRET_KEY || 'my-super-secret-streaming-key-2026';
 const TOKEN_EXPIRY_HOURS = 2;
 
 // ==========================================
-// 1. نظام الاتصالات المطور
+// 1. نظام الاتصالات
 // ==========================================
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 15, keepAliveMsecs: 10000 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 15, keepAliveMsecs: 10000 });
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 20, keepAliveMsecs: 10000 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 20, keepAliveMsecs: 10000 });
 
-// الهيدر الافتراضي المأخوذ من بيانات السيرفر الأول لتجاوز الحظر
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
 
 const axiosInstance = axios.create({
@@ -28,7 +30,7 @@ const axiosInstance = axios.create({
 });
 
 // ==========================================
-// 2. كلاس الكاش الذكي
+// 2. الكاش الذكي
 // ==========================================
 class SmartCache {
     constructor(maxItems = 300, defaultTtlMs = 60000) {
@@ -63,10 +65,6 @@ class SmartCache {
         }
         this.cache.set(key, { data, expiresAt: Date.now() + ttlMs });
     }
-
-    delete(key) {
-        this.cache.delete(key);
-    }
 }
 
 const manifestCache = new SmartCache(50, 3000); 
@@ -91,18 +89,16 @@ function setCooldown(url, durationMs = 4000) {
 }
 
 // ==========================================
-// 3. الميدل وير ودوال حقن الهيدرز الذكية
+// 3. الميدل وير وتسهيل مسارات الـ URLs
 // ==========================================
 
-// استثناء قطع الفيديو من ضغط gzip لحمايتها من التلف في مشغلات الويب
 app.use(compression({
     filter: (req, res) => {
-        if (req.path.startsWith('/proxy')) return false;
+        if (req.path.startsWith('/segment')) return false;
         return compression.filter(req, res);
     }
 }));
 
-// إعدادات CORS المتقدمة
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -112,7 +108,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// استخراج الرابط الكامل كاملاً بدون قطع التوكن
+// استخراج الرابط بالكامل
 function extractTargetUrl(req) {
     const rawUrlIndex = req.originalUrl.indexOf('url=');
     if (rawUrlIndex !== -1) {
@@ -126,64 +122,34 @@ function extractTargetUrl(req) {
     return req.query.url || null;
 }
 
-// بناء وحقن الترويسات الهامة للسيرفر الأصلي
 function getHeadersForUrl(targetUrl, req = null) {
     try {
         const parsedUrl = new URL(targetUrl);
-        
-        // جلب User-Agent من الطلب أو استخدام User-Agent الخاص بـ Chrome تلقائياً
         const userAgent = (req && req.headers['user-agent'] && !req.headers['user-agent'].includes('node-fetch'))
             ? req.headers['user-agent']
             : DEFAULT_USER_AGENT;
 
-        const referer = (req && req.headers['referer'])
-            ? req.headers['referer']
-            : `${parsedUrl.origin}/`;
-
-        const headers = {
+        return {
             'User-Agent': userAgent,
             'Accept': '*/*',
-            'Referer': referer,
+            'Referer': `${parsedUrl.origin}/`,
             'Origin': parsedUrl.origin
         };
-
-        // دعم حقن هيدرز مخصصة قادمة عبر Query Parameter إذا توفرت (?headers={...})
-        if (req && req.query && req.query.headers) {
-            try {
-                const customHeaders = JSON.parse(decodeURIComponent(req.query.headers));
-                Object.assign(headers, customHeaders);
-            } catch (e) {}
-        }
-
-        return headers;
     } catch (e) {
         return { 'User-Agent': DEFAULT_USER_AGENT };
     }
 }
 
-function generateShortToken(targetUrl) {
-    const expiresAt = Date.now() + (TOKEN_EXPIRY_HOURS * 60 * 60 * 1000);
-    const payload = JSON.stringify({ url: targetUrl, exp: expiresAt });
-    const base64Payload = Buffer.from(payload).toString('base64url');
-    const signature = crypto.createHmac('sha256', SECRET_KEY).update(base64Payload).digest('hex');
-    return `${base64Payload}.${signature}`;
+// ترميز وفك تشفير مسارات قطع الفيديو لجعلها نظيفة مثل السيرفرات الأخرى
+function encodeSegmentUrl(url) {
+    return Buffer.from(url).toString('base64url');
 }
 
-function decryptShortToken(token) {
+function decodeSegmentUrl(encoded) {
     try {
-        const parts = token.split('.');
-        if (parts.length !== 2) return { error: 'Invalid' };
-        const [base64Payload, signature] = parts;
-        const expectedSignature = crypto.createHmac('sha256', SECRET_KEY).update(base64Payload).digest('hex');
-        if (signature !== expectedSignature) return { error: 'Invalid' };
-        
-        const payloadJson = Buffer.from(base64Payload, 'base64url').toString('utf8');
-        const { url, exp } = JSON.parse(payloadJson);
-        if (Date.now() > exp) return { error: 'Expired' };
-        
-        return { targetUrl: url };
+        return Buffer.from(encoded, 'base64url').toString('utf8');
     } catch (e) {
-        return { error: 'Invalid' };
+        return null;
     }
 }
 
@@ -221,6 +187,10 @@ async function fetchAndRewriteManifest(targetUrl, req) {
             const baseUrl = parsedFinalUrl.origin;
             const finalSearchParams = parsedFinalUrl.search;
 
+            // تحديد البروتوكول الصحيح (إجبار https على Railway)
+            const hostProtocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+            const hostName = req.get('host');
+
             let lines = response.data.split('\n');
             let rewrittenLines = lines.map(line => {
                 let trimmed = line.trim();
@@ -234,16 +204,14 @@ async function fetchAndRewriteManifest(targetUrl, req) {
                     absoluteLink += finalSearchParams;
                 }
 
-                const hostProtocol = req.protocol;
-                const hostName = req.get('host');
-
-                // إذا كان ملف m3u8 فرعي يتم توجيهه لنقطة نهاية المانفيست
+                // إذا كان ملف m3u8 فرعي
                 if (absoluteLink.includes('.m3u8')) {
                     return `${hostProtocol}://${hostName}/direct/manifest.m3u8?url=${encodeURIComponent(absoluteLink)}`;
                 }
 
-                // توجيه القطع للبروكسي
-                return `${hostProtocol}://${hostName}/proxy?url=${encodeURIComponent(absoluteLink)}`;
+                // تحويل قطعة TS إلى رابط نظيف ومشفر بالكامل
+                const encodedPath = encodeSegmentUrl(absoluteLink);
+                return `${hostProtocol}://${hostName}/segment/${encodedPath}/video.ts`;
             });
 
             const finalManifest = rewrittenLines.join('\n');
@@ -265,11 +233,11 @@ async function fetchAndRewriteManifest(targetUrl, req) {
 }
 
 // ==========================================
-// 5. جلب قطع الفيديو مع دعم Range والمحقونة بالهيدرز
+// 5. جلب قطع الفيديو بمسار نظيف (/segment/:b64/video.ts)
 // ==========================================
-app.get('/proxy', async (req, res) => {
-    const targetUrl = extractTargetUrl(req);
-    if (!targetUrl) return res.status(400).send('No URL provided');
+app.get('/segment/:encodedUrl/video.ts', async (req, res) => {
+    const targetUrl = decodeSegmentUrl(req.params.encodedUrl);
+    if (!targetUrl) return res.status(400).send('Invalid segment path');
 
     try {
         const headers = getHeadersForUrl(targetUrl, req);
@@ -298,44 +266,13 @@ app.get('/proxy', async (req, res) => {
         res.status(response.status).send(Buffer.from(response.data));
 
     } catch (error) {
-        res.status(500).send('Proxy Segment Error');
+        res.status(500).send('Segment Proxy Error');
     }
 });
 
 // ==========================================
 // 6. المسارات الرئيسية
 // ==========================================
-
-app.get('/generate', (req, res) => {
-    const targetUrl = extractTargetUrl(req);
-    if (!targetUrl) return res.status(400).send('Please provide a ?url=...');
-
-    const token = generateShortToken(targetUrl);
-    const shortLink = `${req.protocol}://${req.get('host')}/play/${token}/manifest.m3u8`;
-
-    res.send(`
-        <html dir="rtl" style="background:#0f172a;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;">
-            <h3>رابط البث المشفر:</h3>
-            <input type="text" readonly value="${shortLink}" style="width:80%;max-width:600px;padding:10px;background:#1e293b;border:1px solid #475569;color:#38bdf8;border-radius:6px;" onclick="this.select();">
-        </html>
-    `);
-});
-
-app.get('/play/:token/manifest.m3u8', async (req, res) => {
-    const { token } = req.params;
-    const decrypted = decryptShortToken(token);
-
-    if (decrypted.error === 'Expired') return res.status(403).send('انتهت الصلاحية.');
-    if (decrypted.error === 'Invalid' || !decrypted.targetUrl) return res.status(400).send('رابط غير صالح.');
-
-    try {
-        const manifest = await fetchAndRewriteManifest(decrypted.targetUrl, req);
-        res.set('Content-Type', 'application/vnd.apple.mpegurl');
-        res.send(manifest);
-    } catch (error) {
-        res.status(500).send('Stream error');
-    }
-});
 
 app.get('/direct/manifest.m3u8', async (req, res) => {
     const targetUrl = extractTargetUrl(req);
@@ -348,44 +285,6 @@ app.get('/direct/manifest.m3u8', async (req, res) => {
     } catch (error) {
         res.status(500).send('Direct fetch error');
     }
-});
-
-app.get('/watch', (req, res) => {
-    const targetUrl = extractTargetUrl(req);
-    if (!targetUrl) return res.status(400).send('Please provide a ?url=...');
-
-    const proxyUrl = `/direct/manifest.m3u8?url=${encodeURIComponent(targetUrl)}`;
-
-    res.send(`
-        <!DOCTYPE html>
-        <html lang="ar" dir="rtl">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>مشغل البث المباشر</title>
-            <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-            <style>
-                body { margin: 0; background: #000; display: flex; justify-content: center; align-items: center; height: 100vh; }
-                video { width: 100%; max-width: 960px; height: auto; }
-            </style>
-        </head>
-        <body>
-            <video id="video" controls autoplay playsinline></video>
-            <script>
-                const video = document.getElementById('video');
-                const streamUrl = "${proxyUrl}";
-
-                if (Hls.isSupported()) {
-                    const hls = new Hls({ enableWorker: true });
-                    hls.loadSource(streamUrl);
-                    hls.attachMedia(video);
-                } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-                    video.src = streamUrl;
-                }
-            </script>
-        </body>
-        </html>
-    `);
 });
 
 app.listen(PORT, () => {

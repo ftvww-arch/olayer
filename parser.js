@@ -87,4 +87,4 @@ async function getDirectStream(embedUrl) {
   }
 }
 
-getDirectStream('https://vidoba.org/embed-qv4dnkegkys7.html');
+getDirectStream('https://mp4.okhd.site/embed-e5envbtzwebs.html');

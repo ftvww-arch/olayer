@@ -11,30 +11,46 @@ async function getFaselStreamData(targetUrl) {
 
     const htmlContent = response.data;
 
-    // 1. البحث عن رابط m3u8 صريح داخل الصفحة
-    let m3u8Match = htmlContent.match(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/);
-    let streamUrl = m3u8Match ? m3u8Match[0] : null;
-
-    // 2. إذا لم يكن الرابط صريحاً، يتم تجميعه من الأجزاء النصية للمتغير videoSrc
-    if (!streamUrl) {
-      const srcMatch = htmlContent.match(/videoSrc\s*=\s*([^;]+);/);
-      if (srcMatch) {
-        const stringParts = srcMatch[1].match(/['"]([^'"]+)['"]/g);
-        if (stringParts) {
-          streamUrl = stringParts.map(part => part.replace(/['"]/g, '')).join('');
-        }
-      }
-    }
-
-    if (streamUrl) {
+    // 1. البحث أولاً عن أي رابط m3u8 صريح وكامل
+    let directM3u8 = htmlContent.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/);
+    if (directM3u8) {
       console.log('====================================');
       console.log('تم استخراج الرابط المباشر بنجاح:');
-      console.log(streamUrl);
+      console.log(directM3u8[0]);
       console.log('====================================');
-      return streamUrl;
-    } else {
-      console.log('لم يتم العثور على رابط m3u8.');
+      return directM3u8[0];
     }
+
+    // 2. إذا كان الرابط مجمعاً عبر دالة التشفير المخصصة، نستخرج المتغير المنتهي بـ .m3u8
+    const videoSrcMatch = htmlContent.match(/videoSrc\s*=\s*([^;]+);/);
+    if (!videoSrcMatch) {
+      console.log('لم يتم العثور على كود الفيديو.');
+      return;
+    }
+
+    // استخراج كافة أجزاء النصوص والحروف المتصلة بالرابط
+    const rawParts = videoSrcMatch[1].match(/_0x[a-f0-9]+\(0x[a-f0-9]+,\s*0x[a-f0-9]+,\s*0x[a-f0-9]+,\s*0x[a-f0-9]+\)|'[^']+'|"[^"]+"/g);
+    
+    if (rawParts) {
+      // تنظيف الأجزاء النصية الصريحة ودمجها
+      let reconstructedUrl = rawParts
+        .map(part => part.replace(/['"]/g, ''))
+        .filter(part => !part.startsWith('_0x'))
+        .join('');
+
+      // التأكد من أن النتيجة تحتوي على امتداد البث m3u8
+      if (!reconstructedUrl.endsWith('.m3u8') && htmlContent.includes('hd1080b_playlist.m3u8')) {
+        reconstructedUrl += 'hd1080b_playlist.m3u8';
+      }
+
+      console.log('====================================');
+      console.log('تم استخراج الرابط المباشر بنجاح:');
+      console.log(reconstructedUrl);
+      console.log('====================================');
+      return reconstructedUrl;
+    }
+
+    console.log('لم يتم العثور على رابط m3u8.');
 
   } catch (error) {
     console.error('حدث خطأ أثناء جلب البيانات:', error.message);

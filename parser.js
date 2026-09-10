@@ -1,13 +1,12 @@
 const axios = require('axios');
 
-// دالة فك تشفير Dean Edwards Packer بدون مكتبات خارجية
+// دالة فك تشفير Packer مخصصة وسريعة
 function unpackPacker(packedCode) {
   try {
     const reg = /eval\(function\(p,a,c,k,e,d\)[\s\S]*?\.split\('\|'\)\)\)/;
     const match = packedCode.match(reg);
     if (!match) return null;
 
-    // استخراج المكونات من داخل دالة eval
     const code = match[0];
     const argsMatch = code.match(/}\('([\s\S]*?)',\s*(\d+),\s*(\d+),\s*'([\s\S]*?)'\.split\('\|'\)/);
 
@@ -15,7 +14,6 @@ function unpackPacker(packedCode) {
 
     let [_, payload, baseStr, countStr, keywordsStr] = argsMatch;
     let base = parseInt(baseStr, 10);
-    let count = parseInt(countStr, 10);
     let keywords = keywordsStr.split('|');
 
     function unbase(val, base) {
@@ -31,7 +29,6 @@ function unpackPacker(packedCode) {
       return res;
     }
 
-    // استبدال الكلمات التابعة لجدول التشفير
     return payload.replace(/\b\w+\b/g, (word) => {
       const index = unbase(word, base);
       return keywords[index] || word;
@@ -41,50 +38,58 @@ function unpackPacker(packedCode) {
   }
 }
 
-async function getDirectStream(embedUrl) {
+async function getStreamData(targetUrl) {
   try {
-    const response = await axios.get(embedUrl, {
+    const urlObj = new URL(targetUrl);
+    const domainOrigin = urlObj.origin;
+
+    // 1. طلب كود الصفحة النصي
+    const response = await axios.get(targetUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://vidoba.org/'
+        'Referer': domainOrigin + '/'
       }
     });
 
     const htmlContent = response.data;
 
-    // فك الضغط
+    // 2. فك التشفير برمجياً بالذاكرة
     const unpackedCode = unpackPacker(htmlContent);
-
-    if (!unpackedCode) {
-      console.log('فشل في فك الضغط التلقائي، جاري الفحص عبر التعبيرات النمطية...');
-    }
-
-    // البحث عن رابط m3u8 سواء من النص المفكوك أو النص الاصلي
     const searchTarget = unpackedCode || htmlContent;
+
+    // 3. استخراج رابط البث الرئيسي m3u8
     const m3u8Match = searchTarget.match(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/);
 
-    if (m3u8Match && m3u8Match[0]) {
-      const streamUrl = m3u8Match[0];
-      
-      console.log('====================================');
-      console.log('تم استخراج الرابط المباشر بنجاح:');
-      console.log(streamUrl);
-      console.log('====================================');
-
-      return {
-        streamUrl: streamUrl,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Referer': 'https://vidoba.org/'
-        }
-      };
-    } else {
+    if (!m3u8Match || !m3u8Match[0]) {
       console.log('لم يتم العثور على رابط m3u8.');
+      return;
     }
 
+    const streamUrl = m3u8Match[0];
+    const streamDomainObj = new URL(streamUrl);
+
+    // 4. صياغة المخرجات بهيكلية الـ JSON المطلوبة
+    const resultJson = {
+      "server_url": streamDomainObj.origin,
+      "stream_url": streamUrl,
+      "headers": {
+        "Origin": domainOrigin,
+        "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "sec-ch-ua-mobile": "?0",
+        "Accept": "*/*",
+        "sec-ch-ua-platform": '"Windows"',
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": domainOrigin + "/"
+      }
+    };
+
+    console.log(JSON.stringify(resultJson, null, 4));
+    return resultJson;
+
   } catch (error) {
-    console.error('حدث خطأ أثناء جلب البيانات:', error.message);
+    console.error('حدث خطأ أثناء معالجة الطلب:', error.message);
   }
 }
 
-getDirectStream('https://mp4.okhd.site/embed-e5envbtzwebs.html');
+// تجربة الكود على الدومين الجديد
+getStreamData('https://mp4.okhd.site/embed-ucxfznd08o4y.html');

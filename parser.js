@@ -1,6 +1,6 @@
 const axios = require('axios');
 
-// دالة فك تشفير Packer مخصصة وسريعة
+// دالة فك تشفير Dean Edwards Packer بدون مكتبات خارجية
 function unpackPacker(packedCode) {
   try {
     const reg = /eval\(function\(p,a,c,k,e,d\)[\s\S]*?\.split\('\|'\)\)\)/;
@@ -43,21 +43,32 @@ async function getStreamData(targetUrl) {
     const urlObj = new URL(targetUrl);
     const domainOrigin = urlObj.origin;
 
-    // 1. طلب كود الصفحة النصي
+    // طلب كود الصفحة مع هيدرز كاملة لتجاوز حظر 403
     const response = await axios.get(targetUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': domainOrigin + '/'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Referer': domainOrigin + '/',
+        'Sec-Ch-Ua': '"Chromium";v="128", "Not=A?Brand";v="24", "Google Chrome";v="128"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'cross-site',
+        'Upgrade-Insecure-Requests': '1'
       }
     });
 
     const htmlContent = response.data;
 
-    // 2. فك التشفير برمجياً بالذاكرة
+    // فك تشفير الكود بالذاكرة
     const unpackedCode = unpackPacker(htmlContent);
     const searchTarget = unpackedCode || htmlContent;
 
-    // 3. استخراج رابط البث الرئيسي m3u8
+    // استخراج رابط m3u8
     const m3u8Match = searchTarget.match(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/);
 
     if (!m3u8Match || !m3u8Match[0]) {
@@ -68,17 +79,17 @@ async function getStreamData(targetUrl) {
     const streamUrl = m3u8Match[0];
     const streamDomainObj = new URL(streamUrl);
 
-    // 4. صياغة المخرجات بهيكلية الـ JSON المطلوبة
+    // صياغة المخرجات بنفس تنسيق الـ JSON المطلوب
     const resultJson = {
       "server_url": streamDomainObj.origin,
       "stream_url": streamUrl,
       "headers": {
         "Origin": domainOrigin,
-        "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "sec-ch-ua": '"Chromium";v="128", "Not=A?Brand";v="24", "Google Chrome";v="128"',
         "sec-ch-ua-mobile": "?0",
         "Accept": "*/*",
         "sec-ch-ua-platform": '"Windows"',
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "Referer": domainOrigin + "/"
       }
     };
@@ -91,5 +102,5 @@ async function getStreamData(targetUrl) {
   }
 }
 
-// تجربة الكود على الدومين الجديد
+// تشغيل الدالة على الدومين المستهدف
 getStreamData('https://mp4.okhd.site/embed-ucxfznd08o4y.html');

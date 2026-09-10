@@ -1,88 +1,66 @@
 const axios = require('axios');
-
-function parseFaselHD(htmlContent) {
-  try {
-    // 1. البحث عن مصفوفة النصوص الأساسية
-    const arrayMatch = htmlContent.match(/var _0x1ca549=\[([\s\S]*?)\];/);
-    if (!arrayMatch) return null;
-
-    // تحويل المصفوفة النصية إلى Array حقيقي
-    const rawArray = arrayMatch[1]
-      .split(',')
-      .map(item => item.trim().replace(/^['"]|['"]$/g, ''));
-
-    // 2. دالة فك تشفير Base64 الخاصة بـ fasel-hd
-    function decodeBase64(str) {
-      return Buffer.from(str, 'base64').toString('utf8');
-    }
-
-    // 3. استخراج القيم المباشرة للرابط من الكود
-    const hexMatches = htmlContent.match(/_0x(?:4205ad|423af7)\(0x[a-f0-9]+,\s*0x[a-f0-9]+,\s*0x[a-f0-9]+,\s*0x[a-f0-9]+\)/g);
-    
-    // استخراج أجزاء الرابط النصية الصريحة المحيطة بالدوال
-    const videoSrcLine = htmlContent.match(/var videoSrc=([\s\S]*?);/);
-    if (!videoSrcLine) return null;
-
-    const parts = videoSrcLine[1].split('+');
-    let fullUrl = '';
-
-    for (let part of parts) {
-      part = part.trim();
-      if (part.startsWith("'") || part.startsWith('"')) {
-        // جزء نصي عادي
-        fullUrl += part.replace(/^['"]|['"]$/g, '');
-      } else {
-        // استخراج أرقام الـ Offset من استدعاء الدالة
-        const args = part.match(/0x[a-f0-9]+/g);
-        if (args && args.length >= 3) {
-          const num1 = parseInt(args[0], 16);
-          const num3 = parseInt(args[2], 16);
-          // حساب الـ Index داخل المصفوفة
-          const index = num3 - num1 - 0x1f;
-          if (rawArray[index]) {
-            try {
-              fullUrl += decodeBase64(rawArray[index]);
-            } catch (e) {
-              fullUrl += rawArray[index];
-            }
-          }
-        }
-      }
-    }
-
-    return fullUrl.includes('.m3u8') ? fullUrl : null;
-  } catch (err) {
-    return null;
-  }
-}
+const vm = require('vm'); // وحدة مدمجة في Node.js ولا تحتاج لتثبيت
 
 async function getFaselStreamData(targetUrl) {
   try {
     const response = await axios.get(targetUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
         'Referer': 'https://www.fasel-hd.co/'
       }
     });
 
     const htmlContent = response.data;
 
-    // 1. فحص وجود رابط مباشر صريح
-    let directMatch = htmlContent.match(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/);
-    let streamUrl = directMatch ? directMatch[0] : parseFaselHD(htmlContent);
+    // 1. استخراج كود المشغل المشفر بالكامل كما هو للحفاظ على التنسيق وتخطي حماية Obfuscator
+    const scriptMatch = htmlContent.match(/(var video = document\.getElementById\('video'\);[\s\S]+?)<\/script>/);
 
-    if (streamUrl) {
+    if (!scriptMatch) {
+      console.log('لم يتم العثور على سكريبت المشغل المشفر.');
+      return;
+    }
+
+    const scriptCode = scriptMatch[1];
+
+    // 2. تجهيز بيئة وهمية (Sandbox) آمنة تحاكي المتصفح
+    const sandbox = {
+      document: {
+        getElementById: () => ({
+          canPlayType: () => false,
+          src: ''
+        })
+      },
+      window: {},
+      Hls: {
+        isSupported: () => false
+      },
+      // تعطيل دوال التوقيت لمنع أي Infinite Loops يزرعها التشفير كفخ
+      setInterval: () => {},
+      setTimeout: () => {},
+      console: { log: () => {}, warn: () => {}, error: () => {} }
+    };
+
+    // ربط البيئة الوهمية لتخطي فحص الكود لخصائص المتصفح
+    sandbox.window = sandbox;
+    sandbox.global = sandbox;
+
+    // 3. تشغيل الكود المشفر داخل البيئة الوهمية ليفك تشفير نفسه برمجياً
+    vm.createContext(sandbox);
+    vm.runInContext(scriptCode, sandbox);
+
+    // 4. استخراج الرابط المباشر بعد تجميعه بواسطة الكود نفسه
+    if (sandbox.videoSrc) {
       console.log('====================================');
       console.log('تم استخراج الرابط المباشر بنجاح:');
-      console.log(streamUrl);
+      console.log(sandbox.videoSrc);
       console.log('====================================');
-      return streamUrl;
+      return sandbox.videoSrc;
     } else {
-      console.log('لم يتم العثور على رابط m3u8.');
+      console.log('لم يتم العثور على الرابط بعد تنفيذ الكود.');
     }
 
   } catch (error) {
-    console.error('حدث خطأ أثناء جلب البيانات:', error.message);
+    console.error('حدث خطأ أثناء التنفيذ:', error.message);
   }
 }
 
